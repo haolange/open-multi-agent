@@ -1,19 +1,13 @@
 # API 参考
 
 <cite>
-**本文引用的文件**
+**本文档引用的文件**
 - [src/index.ts](file://src/index.ts)
-- [src/types.ts](file://src/types.ts)
 - [src/orchestrator/orchestrator.ts](file://src/orchestrator/orchestrator.ts)
+- [src/types.ts](file://src/types.ts)
 - [src/team/team.ts](file://src/team/team.ts)
 - [src/agent/agent.ts](file://src/agent/agent.ts)
-- [src/agent/runner.ts](file://src/agent/runner.ts)
-- [src/tool/framework.ts](file://src/tool/framework.ts)
-- [examples/01-single-agent.ts](file://examples/01-single-agent.ts)
-- [examples/02-team-collaboration.ts](file://examples/02-team-collaboration.ts)
-- [tests/approval.test.ts](file://tests/approval.test.ts)
-- [tests/agent-hooks.test.ts](file://tests/agent-hooks.test.ts)
-- [README.md](file://README.md)
+- [package.json](file://package.json)
 </cite>
 
 ## 目录
@@ -22,381 +16,294 @@
 3. [核心组件](#核心组件)
 4. [架构总览](#架构总览)
 5. [详细组件分析](#详细组件分析)
-6. [依赖关系分析](#依赖关系分析)
-7. [性能与并发](#性能与并发)
+6. [依赖分析](#依赖分析)
+7. [性能考虑](#性能考虑)
 8. [故障排查指南](#故障排查指南)
 9. [结论](#结论)
-10. [附录：类型定义参考](#附录类型定义参考)
+10. [附录](#附录)
 
 ## 简介
-本文件为 Open Multi-Agent 框架的完整 API 参考，覆盖公开类与接口、类型定义、事件回调系统、错误处理与异常类型，并提供使用示例路径与最佳实践。重点围绕以下公共 API：
-- OpenMultiAgent 类及其方法：createTeam、runTeam、runTasks、runAgent
-- 核心配置类型：AgentConfig、TeamConfig、TaskConfig
-- 事件回调系统：onProgress、onTrace、onApproval
-- 错误处理与异常类型说明
+本文件为 Open Multi-Agent 框架的完整 API 参考，聚焦于 OpenMultiAgent 主类及其公共接口，涵盖以下方法：
+- createTeam()
+- runTeam()
+- runTasks()
+- runAgent()
+- getStatus()
+
+同时，文档详细说明 AgentConfig 与 TeamConfig 的全部配置项、类型定义、接口规范、枚举值、方法间调用关系与使用模式，并提供与实际代码实现一致的版本兼容性信息与迁移建议。
 
 ## 项目结构
-框架采用模块化分层设计，主要模块如下：
-- orchestrator：编排器，负责任务队列、调度、并发控制与进度/追踪回调
-- team：团队协作，包含消息总线、任务队列与共享内存
-- agent：智能体运行时，封装对话循环、工具执行、钩子与流式输出
-- tool：工具注册与执行框架，支持自定义工具与内置工具
-- llm：适配器层，统一不同模型提供商的聊天与流式接口
-- memory：共享内存抽象
-- types：公共类型定义与事件/追踪类型
+框架采用模块化分层设计，核心入口通过统一导出模块暴露公共 API；Orchestrator 作为顶层编排器协调 Team、AgentPool、TaskQueue、Scheduler 等子系统。
 
 ```mermaid
 graph TB
-OM["OpenMultiAgent<br/>编排器"] --> Team["Team<br/>团队"]
-OM --> Pool["AgentPool<br/>并发池"]
-OM --> Queue["TaskQueue<br/>任务队列"]
-OM --> Scheduler["Scheduler<br/>调度策略"]
-Team --> Bus["MessageBus<br/>消息总线"]
-Team --> TQueue["TaskQueue<br/>任务队列"]
-Team --> Mem["SharedMemory<br/>共享内存"]
-Pool --> Agent["Agent<br/>智能体"]
-Agent --> Runner["AgentRunner<br/>对话循环"]
-Runner --> Adapter["LLMAdapter<br/>模型适配器"]
-Runner --> Registry["ToolRegistry<br/>工具注册表"]
-Registry --> Executor["ToolExecutor<br/>工具执行器"]
+OM["OpenMultiAgent<br/>顶层编排器"] --> TM["Team<br/>团队对象"]
+OM --> AP["AgentPool<br/>并发执行池"]
+OM --> SQ["TaskQueue<br/>任务队列"]
+OM --> SCH["Scheduler<br/>调度策略"]
+OM --> AG["Agent<br/>单智能体运行器"]
+OM --> AD["LLMAdapter<br/>适配器层"]
+OM --> TR["ToolRegistry<br/>工具注册表"]
+OM --> TE["ToolExecutor<br/>工具执行器"]
+TM --> MB["MessageBus<br/>消息总线"]
+TM --> SM["SharedMemory<br/>共享内存"]
 ```
 
 图表来源
-- [src/orchestrator/orchestrator.ts:508-1072](file://src/orchestrator/orchestrator.ts#L508-L1072)
-- [src/team/team.ts:88-335](file://src/team/team.ts#L88-L335)
-- [src/agent/agent.ts:81-623](file://src/agent/agent.ts#L81-L623)
-- [src/agent/runner.ts:166-543](file://src/agent/runner.ts#L166-L543)
-- [src/tool/framework.ts:93-203](file://src/tool/framework.ts#L93-L203)
+- [src/orchestrator/orchestrator.ts:1-120](file://src/orchestrator/orchestrator.ts#L1-L120)
+- [src/team/team.ts:1-120](file://src/team/team.ts#L1-L120)
+- [src/agent/agent.ts:1-120](file://src/agent/agent.ts#L1-L120)
 
 章节来源
-- [README.md:137-178](file://README.md#L137-L178)
+- [src/index.ts:57-201](file://src/index.ts#L57-L201)
+- [src/orchestrator/orchestrator.ts:1-120](file://src/orchestrator/orchestrator.ts#L1-L120)
 
 ## 核心组件
-本节概述公开 API 的职责与调用入口。
-
-- OpenMultiAgent：顶层编排器，提供 createTeam、runTeam、runTasks、runAgent、getStatus、shutdown 等方法；支持 onProgress、onTrace、onApproval 回调。
-- Team：团队对象，管理代理清单、消息总线、任务队列与共享内存；提供任务增删改查、消息广播与订阅等能力。
-- Agent：单个智能体，封装 run/prompt/stream、工具注册、钩子、状态跟踪与结构化输出验证。
-- AgentRunner：对话循环引擎，负责 LLM 调用、工具提取与执行、循环控制、流式事件与追踪。
-- ToolRegistry/ToolExecutor：工具定义、注册与执行框架。
-- LLMAdapter：统一的模型适配器接口，屏蔽不同提供商差异。
-- SharedMemory/MemoryStore：共享内存抽象，支持键值存取与命名空间摘要。
+- OpenMultiAgent：顶层编排器，负责团队管理、自动编排（runTeam）、显式任务执行（runTasks）、单智能体便捷执行（runAgent）以及运行状态查询（getStatus）。
+- Team：封装代理名单、消息总线、任务队列与可选共享内存，提供事件总线与任务管理能力。
+- Agent：面向用户的高阶智能体包装，支持一次性对话（run）、持续对话（prompt）、流式输出（stream），并内置动态工具注册与生命周期状态跟踪。
+- 类型系统：集中于 types.ts，定义内容块、LLM 协议、工具、代理、团队、任务、编排器、追踪等完整类型族。
 
 章节来源
-- [src/index.ts:57-182](file://src/index.ts#L57-L182)
-- [src/orchestrator/orchestrator.ts:514-1072](file://src/orchestrator/orchestrator.ts#L514-L1072)
-- [src/team/team.ts:88-335](file://src/team/team.ts#L88-L335)
-- [src/agent/agent.ts:81-623](file://src/agent/agent.ts#L81-L623)
-- [src/agent/runner.ts:166-543](file://src/agent/runner.ts#L166-L543)
-- [src/tool/framework.ts:93-203](file://src/tool/framework.ts#L93-L203)
+- [src/orchestrator/orchestrator.ts:900-1785](file://src/orchestrator/orchestrator.ts#L900-L1785)
+- [src/team/team.ts:88-346](file://src/team/team.ts#L88-L346)
+- [src/agent/agent.ts:94-670](file://src/agent/agent.ts#L94-L670)
+- [src/types.ts:1-1106](file://src/types.ts#L1-L1106)
 
 ## 架构总览
-下图展示从高层 API 到底层实现的关键交互流程。
+下图展示 OpenMultiAgent 的关键方法与其内部协作关系，包括 runTeam 的“分解-执行-合成”三段式流程与 runTasks 的直接任务执行路径。
 
 ```mermaid
 sequenceDiagram
-participant U as "用户代码"
+participant U as "用户"
 participant OM as "OpenMultiAgent"
-participant Team as "Team"
-participant Pool as "AgentPool"
-participant Agent as "Agent"
-participant Runner as "AgentRunner"
-participant Adapter as "LLMAdapter"
-participant Registry as "ToolRegistry"
-participant Executor as "ToolExecutor"
-U->>OM : 调用 runTeam()/runTasks()/runAgent()
-OM->>Team : 创建/获取团队上下文
-OM->>Pool : 构建并发池
-OM->>Runner : 执行任务轮次
-Runner->>Adapter : chat()/stream()
-Runner->>Registry : toToolDefs()
-Runner->>Executor : 并行执行工具
-Runner-->>OM : 返回 RunResult/AgentRunResult
-OM-->>U : 返回 TeamRunResult/AgentRunResult
+participant CO as "协调者(临时)"
+participant TP as "任务队列"
+participant PO as "AgentPool"
+participant AG as "Agent"
+participant AD as "LLMAdapter"
+U->>OM : 调用 runTeam(team, goal[, options])
+OM->>CO : 构建协调者配置并运行分解
+CO-->>OM : 返回任务清单(JSON)
+OM->>TP : 加载任务并建立依赖图
+OM->>PO : 构建并发执行池
+loop 并行批次
+PO->>AG : 分配任务并执行
+AG->>AD : 发起 LLM 请求
+AD-->>AG : 返回响应/流事件
+AG-->>PO : 返回 AgentRunResult
+PO-->>OM : 汇总结果
+end
+OM->>CO : 运行合成提示
+CO-->>OM : 最终答案
+OM-->>U : TeamRunResult
+U->>OM : 调用 runTasks(team, tasks[, options])
+OM->>TP : 直接加载任务
+OM->>PO : 构建池并执行
+PO-->>OM : 批次完成
+OM-->>U : TeamRunResult
 ```
 
 图表来源
-- [src/orchestrator/orchestrator.ts:641-740](file://src/orchestrator/orchestrator.ts#L641-L740)
-- [src/agent/runner.ts:191-522](file://src/agent/runner.ts#L191-L522)
-- [src/agent/agent.ts:177-372](file://src/agent/agent.ts#L177-L372)
-- [src/tool/framework.ts:162-202](file://src/tool/framework.ts#L162-L202)
+- [src/orchestrator/orchestrator.ts:1061-1374](file://src/orchestrator/orchestrator.ts#L1061-L1374)
+- [src/orchestrator/orchestrator.ts:1390-1454](file://src/orchestrator/orchestrator.ts#L1390-L1454)
 
 ## 详细组件分析
 
-### OpenMultiAgent 类 API
-- 方法概览
+### OpenMultiAgent 主类 API
+
+- 方法签名与行为概览
   - createTeam(name: string, config: TeamConfig): Team
-  - runAgent(config: AgentConfig, prompt: string): Promise<AgentRunResult>
-  - runTeam(team: Team, goal: string): Promise<TeamRunResult>
-  - runTasks(team: Team, tasks: Task[]): Promise<TeamRunResult>
+    - 创建并注册团队，用于后续 runTeam/runTasks 使用。
+    - 参数校验：重复名称抛出异常；TeamConfig 中可启用共享内存或自定义 MemoryStore。
+  - runTeam(team: Team, goal: string, options?: RunTeamOptions): Promise<TeamRunResult>
+    - 自动编排入口：协调者分解目标为任务，构建依赖图，调度执行，最终合成结果。
+    - 支持计划仅模式（planOnly）、揭示协调者上下文（revealCoordinator）等选项。
+  - runTasks(team: Team, tasks: TaskDescriptor[], options?: { abortSignal?: AbortSignal }): Promise<TeamRunResult>
+    - 显式任务执行：直接加载任务列表，自动分配未指派任务，按依赖顺序执行。
+  - runAgent(config: AgentConfig, prompt: string, options?: { abortSignal?: AbortSignal }): Promise<AgentRunResult>
+    - 单智能体一次性执行：构建临时 Agent，运行单轮对话并返回结果。
   - getStatus(): { teams: number; activeAgents: number; completedTasks: number }
-  - shutdown(): Promise<void>
-- 配置项
-  - OrchestratorConfig：maxConcurrency、defaultModel、defaultProvider、defaultBaseURL、defaultApiKey、onProgress、onTrace、onApproval
-- 关键行为
-  - 自动协调：runTeam 内部通过“协调者”代理分解目标为任务，构建依赖图并调度执行。
-  - 并发执行：独立任务在 maxConcurrency 下并行执行。
-  - 进度回调：onProgress 接收 OrchestratorEvent 事件。
-  - 追踪回调：onTrace 接收 TraceEvent，用于可观测性。
-  - 审批门控：onApproval 在每轮任务完成后决定是否继续下一阶段。
-  - 重试机制：executeWithRetry 支持任务级指数退避重试。
-- 使用示例
-  - 单智能体：参见 [examples/01-single-agent.ts:34-59](file://examples/01-single-agent.ts#L34-L59)
-  - 团队协作：参见 [examples/02-team-collaboration.ts:128-167](file://examples/02-team-collaboration.ts#L128-L167)
+    - 轻量级运行状态快照：统计已注册团队数、累计成功任务数等。
+
+- 参数与返回值要点
+  - TeamConfig：包含团队名称、代理数组、共享内存开关或自定义存储、最大并发度等。
+  - RunTeamOptions：可选覆盖协调者配置、是否仅生成计划、是否在工人提示中注入协调者上下文等。
+  - TeamRunResult：包含整体成功标志、任务明细、各代理结果映射、总 token 消耗等。
+  - AgentRunResult：包含成功标志、输出文本、消息历史、token 使用、工具调用记录、结构化输出等。
+
+- 错误处理与取消
+  - 支持 AbortSignal 在多处注入（runTeam、runTasks、runAgent、Agent.run/stream）。
+  - Token 预算超限触发预算耗尽事件与相应标记。
+  - onApproval/onPlanReady/onProgress/onTrace 等回调提供可观测性与控制点。
+
+- 使用示例（参考）
+  - 单智能体执行：参见 [examples/basics/single-agent.ts:31-36](file://examples/basics/single-agent.ts#L31-L36)。
+  - 团队协作执行：参见 [examples/basics/team-collaboration.ts:127-127](file://examples/basics/team-collaboration.ts#L127-L127)。
+  - 任务流水线执行：参见 [examples/basics/task-pipeline.ts:181-181](file://examples/basics/task-pipeline.ts#L181-L181)。
 
 章节来源
-- [src/orchestrator/orchestrator.ts:514-1072](file://src/orchestrator/orchestrator.ts#L514-L1072)
-- [src/types.ts:386-411](file://src/types.ts#L386-L411)
-- [examples/01-single-agent.ts:34-59](file://examples/01-single-agent.ts#L34-L59)
-- [examples/02-team-collaboration.ts:128-167](file://examples/02-team-collaboration.ts#L128-L167)
+- [src/orchestrator/orchestrator.ts:947-1474](file://src/orchestrator/orchestrator.ts#L947-L1474)
+- [src/types.ts:609-730](file://src/types.ts#L609-L730)
+- [src/types.ts:659-673](file://src/types.ts#L659-L673)
+- [src/types.ts:815-875](file://src/types.ts#L815-L875)
 
-#### runTeam 流程时序
+#### runTeam 内部流程（算法）
 ```mermaid
-sequenceDiagram
-participant OM as "OpenMultiAgent"
-participant Coord as "协调者 Agent"
-participant Q as "TaskQueue"
-participant S as "Scheduler"
-participant P as "AgentPool"
-OM->>Coord : run(decompositionPrompt)
-Coord-->>OM : 输出任务数组(JSON)
-OM->>Q : 加载任务/解析依赖
-OM->>S : autoAssign()
-OM->>P : 并行执行任务
-P-->>OM : 返回 AgentRunResult
-OM->>Coord : run(synthesisPrompt)
-Coord-->>OM : 最终合成结果
-OM-->>OM : 聚合 TeamRunResult
+flowchart TD
+Start(["开始 runTeam"]) --> CheckSimple["检查是否为简单目标"]
+CheckSimple --> |是| SC["短路：选择最佳代理直接执行"]
+CheckSimple --> |否| Decompose["协调者分解目标为任务"]
+Decompose --> Parse["解析任务清单(JSON)"]
+Parse --> |失败| Fallback["回退：每代理一个任务"]
+Parse --> |成功| Load["加载到任务队列并建立依赖"]
+Load --> Assign["调度器自动分配未指派任务"]
+Assign --> BuildPool["构建 AgentPool 并执行"]
+BuildPool --> BudgetCheck{"预算是否超限?"}
+BudgetCheck --> |是| Skip["跳过剩余任务并返回"]
+BudgetCheck --> |否| Synthesize["协调者合成最终答案"]
+Synthesize --> Done(["返回 TeamRunResult"])
+SC --> Done
+Fallback --> Assign
 ```
 
 图表来源
-- [src/orchestrator/orchestrator.ts:641-740](file://src/orchestrator/orchestrator.ts#L641-L740)
-- [src/orchestrator/orchestrator.ts:893-936](file://src/orchestrator/orchestrator.ts#L893-L936)
+- [src/orchestrator/orchestrator.ts:1079-1374](file://src/orchestrator/orchestrator.ts#L1079-L1374)
 
-### Team 类 API
-- 方法概览
-  - getAgents(): AgentConfig[]
-  - getAgent(name: string): AgentConfig | undefined
-  - sendMessage(from: string, to: string, content: string): void
-  - broadcast(from: string, content: string): void
-  - getMessages(agentName: string): Message[]
-  - addTask(task: Omit<Task,'id'|'createdAt'|'updatedAt'>): Task
-  - getTasks(): Task[]
-  - getTasksByAssignee(agentName: string): Task[]
-  - updateTask(taskId: string, update: Partial<Task>): Task
-  - getNextTask(agentName: string): Task | undefined
-  - getSharedMemory(): MemoryStore | undefined
-  - getSharedMemoryInstance(): SharedMemory | undefined
-  - on(event: string, handler: (data: unknown) => void): () => void
-  - emit(event: string, data: unknown): void
-- 事件系统
-  - 内置事件：task:ready、task:complete、task:failed、all:complete、message、broadcast
-  - 数据类型：unknown；建议转换为 OrchestratorEvent 获取结构化字段
+### AgentConfig 与 TeamConfig 完整配置
 
-章节来源
-- [src/team/team.ts:88-335](file://src/team/team.ts#L88-L335)
+- AgentConfig 关键字段
+  - 基础：name、model、provider、apiKey、baseURL、region
+  - 提示与推理：systemPrompt、thinking（含 enabled、budgetTokens、effort）
+  - 工具：customTools、tools、disallowedTools、toolPreset、maxToolOutputChars
+  - 上下文与节流：contextStrategy（滑动窗口/摘要/紧凑/自定义压缩）、compressToolResults、maxTurns、maxTokens、maxTokenBudget、timeoutMs
+  - 推理采样：temperature、frequencyPenalty、presencePenalty、topP、topK、minP、parallelToolCalls、extraBody
+  - 循环检测：loopDetection（maxRepetitions、loopDetectionWindow、onLoopDetected）
+  - 结构化输出：outputSchema（Zod Schema，运行时验证最终 JSON）
+  - 生命周期钩子：beforeRun、afterRun
+  - 兼容性：adapter 可直接指定适配器实例以绕过默认工厂
 
-### Agent 类 API
-- 方法概览
-  - run(prompt: string, runOptions?: Partial<RunOptions>): Promise<AgentRunResult>
-  - prompt(message: string): Promise<AgentRunResult>
-  - stream(prompt: string): AsyncGenerator<StreamEvent>
-  - getState(): AgentState
-  - getHistory(): LLMMessage[]
-  - reset(): void
-  - addTool(tool: ToolDefinition): void
-  - removeTool(name: string): void
-  - getTools(): string[]
-  - buildToolContext(abortSignal?: AbortSignal): ToolUseContext
-- 钩子
-  - beforeRun(context: BeforeRunHookContext): BeforeRunHookContext | Promise<BeforeRunHookContext>
-  - afterRun(result: AgentRunResult): AgentRunResult | Promise<AgentRunResult>
-- 结构化输出
-  - outputSchema: ZodSchema，自动解析与一次重试验证
+- TeamConfig 关键字段
+  - 基础：name、agents（AgentConfig 数组）
+  - 共享内存：sharedMemory（布尔）或 sharedMemoryStore（MemoryStore 实例）
+  - 并发：maxConcurrency
+
+- 类型与枚举
+  - ContextStrategy：支持滑动窗口、摘要、紧凑压缩与自定义压缩函数
+  - TaskStatus：pending、in_progress、completed、failed、blocked、skipped
+  - TraceEventType：llm_call、tool_call、task、agent、plan_ready、agent_stream
+  - SupportedProvider：由 LLM 适配器层定义（通过类型导出）
 
 章节来源
-- [src/agent/agent.ts:81-623](file://src/agent/agent.ts#L81-L623)
-- [src/agent/runner.ts:166-543](file://src/agent/runner.ts#L166-L543)
+- [src/types.ts:367-531](file://src/types.ts#L367-L531)
+- [src/types.ts:608-623](file://src/types.ts#L608-L623)
+- [src/types.ts:124-152](file://src/types.ts#L124-L152)
+- [src/types.ts:679-729](file://src/types.ts#L679-L729)
+- [src/types.ts:882-968](file://src/types.ts#L882-L968)
 
-### AgentRunner 类 API
-- 方法概览
-  - run(messages: LLMMessage[], options?: RunOptions): Promise<RunResult>
-  - stream(initialMessages: LLMMessage[], options?: RunOptions): AsyncGenerator<StreamEvent>
-- 配置
-  - RunnerOptions：model、systemPrompt、maxTurns、maxTokens、temperature、abortSignal、allowedTools、agentName、agentRole、loopDetection
-  - RunOptions：onToolCall、onToolResult、onMessage、onWarning、onTrace、runId、taskId、traceAgent、abortSignal
-- 行为
-  - 工具并行执行、循环检测、流式事件、追踪上报
+### 类型与接口规范
 
-章节来源
-- [src/agent/runner.ts:166-543](file://src/agent/runner.ts#L166-L543)
+- 内容块与消息
+  - ContentBlock：TextBlock、ReasoningBlock、ToolUseBlock、ToolResultBlock、ImageBlock
+  - LLMMessage：角色与内容块数组
+  - LLMResponse：响应 ID、内容块、模型名、停止原因、token 使用
 
-### 工具系统
-- defineTool(config)：定义类型安全工具
-- ToolRegistry：注册/注销/列出工具，导出 LLMToolDef
-- ToolExecutor：按名称执行工具，收集 ToolResult
+- 工具系统
+  - ToolDefinition：name/description/inputSchema/outputSchema(llmInputSchema)、execute
+  - ToolResult：data、isError、metadata(tokenUsage)
+  - ToolUseContext：agent、team、abortSignal/abortController、cwd、metadata
 
-章节来源
-- [src/tool/framework.ts:71-203](file://src/tool/framework.ts#L71-L203)
+- 代理运行结果
+  - AgentRunResult：success、output、messages、tokenUsage、toolCalls、structured、loopDetected、budgetExceeded
 
-### 事件与追踪
-- OrchestratorEvent：agent_start、agent_complete、task_start、task_complete、task_skipped、task_retry、message、error
-- TraceEvent：llm_call、tool_call、task、agent，携带 runId、agent、taskId、时间戳与用量信息
-- 回调
-  - onProgress：接收 OrchestratorEvent
-  - onTrace：接收 TraceEvent
-  - onApproval：在每轮任务完成后决定是否继续
+- 团队与任务
+  - TeamRunResult：success、goal、tasks、agentResults(Map)、totalTokenUsage
+  - Task：id/title/description/status/assignee/dependsOn/memoryScope/result/时间戳与重试配置
+
+- 编排器事件与追踪
+  - OrchestratorEvent：agent_start/agent_complete/task_start/task_complete/task_retry/budget_exceeded/message/error
+  - TraceEvent：LLMCallTrace、ToolCallTrace、TaskTrace、AgentTrace、PlanReadyTrace、AgentStreamTrace
 
 章节来源
-- [src/types.ts:370-470](file://src/types.ts#L370-L470)
-- [src/orchestrator/orchestrator.ts:280-464](file://src/orchestrator/orchestrator.ts#L280-L464)
-- [tests/approval.test.ts:206-370](file://tests/approval.test.ts#L206-L370)
+- [src/types.ts:15-110](file://src/types.ts#L15-L110)
+- [src/types.ts:160-167](file://src/types.ts#L160-L167)
+- [src/types.ts:184-187](file://src/types.ts#L184-L187)
+- [src/types.ts:286-328](file://src/types.ts#L286-L328)
+- [src/types.ts:585-602](file://src/types.ts#L585-L602)
+- [src/types.ts:659-673](file://src/types.ts#L659-L673)
+- [src/types.ts:704-729](file://src/types.ts#L704-L729)
+- [src/types.ts:741-755](file://src/types.ts#L741-L755)
+- [src/types.ts:907-968](file://src/types.ts#L907-L968)
 
-## 依赖关系分析
-- 组件耦合
-  - OpenMultiAgent 依赖 Team、AgentPool、TaskQueue、Scheduler、Agent、ToolRegistry、ToolExecutor、LLMAdapter
-  - Agent 依赖 AgentRunner、ToolRegistry、ToolExecutor、LLMAdapter
-  - AgentRunner 依赖 ToolRegistry、ToolExecutor、LLMAdapter
+### 方法间调用关系与使用模式
+
+- createTeam() 与 Team 对象
+  - 注册团队后，Team 提供 getAgents()/getAgent()、sendMessage()/broadcast()、addTask()/updateTask()/getNextTask()、getSharedMemory() 等能力。
+  - Team 内部桥接 TaskQueue 事件到 Team 级事件总线，便于外部订阅。
+
+- runTeam() 与 runTasks() 的差异
+  - runTeam()：自动分解、依赖解析、调度、并发执行、合成；适合高层目标驱动的编排。
+  - runTasks()：直接执行给定任务列表，适合已有明确任务规划的场景。
+
+- runAgent() 与 Agent 的关系
+  - runAgent() 是对单次 Agent.run() 的便捷封装，支持追踪与取消信号注入。
+
+- 并发与预算
+  - AgentPool 控制并发度；全局 OrchestratorConfig.maxTokenBudget 与单 AgentConfig.maxTokenBudget 可叠加生效。
+  - 执行过程中通过 onProgress/onTrace/onApproval/onPlanReady 提供可观测性与控制。
+
+章节来源
+- [src/team/team.ts:88-346](file://src/team/team.ts#L88-L346)
+- [src/orchestrator/orchestrator.ts:947-1474](file://src/orchestrator/orchestrator.ts#L947-L1474)
+- [src/agent/agent.ts:205-251](file://src/agent/agent.ts#L205-L251)
+
+## 依赖分析
 - 外部依赖
-  - Zod 用于结构化输出校验与 JSON Schema 转换
-  - 各大模型提供商 SDK 通过 LLMAdapter 抽象接入
-
-```mermaid
-classDiagram
-class OpenMultiAgent
-class Team
-class AgentPool
-class TaskQueue
-class Scheduler
-class Agent
-class AgentRunner
-class ToolRegistry
-class ToolExecutor
-class LLMAdapter
-OpenMultiAgent --> Team : "创建/管理"
-OpenMultiAgent --> AgentPool : "构建"
-OpenMultiAgent --> TaskQueue : "调度"
-OpenMultiAgent --> Scheduler : "分配"
-OpenMultiAgent --> Agent : "运行"
-Agent --> AgentRunner : "委托"
-AgentRunner --> ToolRegistry : "读取工具定义"
-AgentRunner --> ToolExecutor : "执行工具"
-AgentRunner --> LLMAdapter : "调用模型"
-```
-
-图表来源
-- [src/orchestrator/orchestrator.ts:514-1072](file://src/orchestrator/orchestrator.ts#L514-L1072)
-- [src/agent/agent.ts:81-623](file://src/agent/agent.ts#L81-L623)
-- [src/agent/runner.ts:166-543](file://src/agent/runner.ts#L166-L543)
-- [src/tool/framework.ts:93-203](file://src/tool/framework.ts#L93-L203)
-
-## 性能与并发
-- 并发控制
-  - maxConcurrency 控制 AgentPool 并发度，默认 5
-  - 任务并行：无共享依赖的任务在一轮内并行执行
-- 重试与退避
-  - executeWithRetry 支持 maxRetries、retryDelayMs、retryBackoff
-  - 重试延迟上限 30 秒，避免指数爆炸
-- 循环检测
-  - LoopDetectionConfig 提供重复工具调用/文本检测，支持 warn/terminate/custom 动作
-- 超时保护
-  - AgentConfig.timeoutMs 对单次 run/prompt/stream 设置超时信号
+  - @anthropic-ai/sdk、openai、zod：核心 LLM 适配与数据校验
+  - 可选 peerDependencies：@aws-sdk/client-bedrock-runtime、@google/genai、@modelcontextprotocol/sdk、ai
+- Node.js 版本要求：>= 18.0.0
+- 包导出：主入口 dist/index.js，CLI 二进制 oma
 
 章节来源
-- [src/orchestrator/orchestrator.ts:108-194](file://src/orchestrator/orchestrator.ts#L108-L194)
-- [src/agent/agent.ts:312-326](file://src/agent/agent.ts#L312-L326)
-- [src/agent/runner.ts:257-366](file://src/agent/runner.ts#L257-L366)
+- [package.json:69-107](file://package.json#L69-L107)
+
+## 性能考虑
+- 并发与吞吐
+  - 通过 OrchestratorConfig.maxConcurrency 与 AgentPool 控制并发；合理设置避免模型侧限流与内存压力。
+- 上下文与成本
+  - 合理使用 contextStrategy（滑动窗口/摘要/紧凑）与 compressToolResults，降低 token 消耗。
+- 重试与稳定性
+  - 任务级重试（maxRetries/retryDelayMs/retryBackoff）提升鲁棒性；结合 onApproval 实现人工审批门控。
+- 预算控制
+  - 合理设置 maxTokenBudget 与单轮 maxTokens，防止意外超额；利用 budgetExceeded 标记进行降级处理。
 
 ## 故障排查指南
-- 审批门控 onApproval
-  - 回调抛错会跳过剩余任务并标记 skipped
-  - 仅在有成功完成任务且存在下一轮任务时触发
-- 钩子 beforeRun/afterRun
-  - beforeRun 抛错直接中止本次运行
-  - afterRun 抛错将失败标记到最终结果
-- 结构化输出
-  - outputSchema 验证失败会自动重试一次，仍失败则返回失败结果
-- 本地模型工具调用
-  - 若模型不支持原生 tool_calls，框架会尝试从文本中提取
-  - 建议设置 timeoutMs 防止长时间阻塞
+- 常见问题与定位
+  - 重复团队名：createTeam 抛出异常，需更换唯一名称或调用 shutdown 清理。
+  - 任务无分配代理：executeQueue 将失败并上报错误事件；检查调度与任务描述。
+  - 预算超限：onProgress 触发 budget_exceeded 事件；检查 OrchestratorConfig.maxTokenBudget 与单 AgentConfig.maxTokenBudget 设置。
+  - 循环检测：loopDetection 触发 warn/terminate 或自定义回调；调整系统提示或工具调用策略。
+- 观测与调试
+  - 使用 onProgress/onTrace/onAgentStream 获取运行时事件与追踪数据，辅助定位瓶颈与异常。
+  - 使用 Team.on(...) 订阅任务/消息事件，观察队列状态变化。
 
 章节来源
-- [tests/approval.test.ts:304-317](file://tests/approval.test.ts#L304-L317)
-- [tests/agent-hooks.test.ts:112-124](file://tests/agent-hooks.test.ts#L112-L124)
-- [src/agent/agent.ts:400-477](file://src/agent/agent.ts#L400-L477)
-- [README.md:206-232](file://README.md#L206-L232)
+- [src/orchestrator/orchestrator.ts:561-818](file://src/orchestrator/orchestrator.ts#L561-L818)
+- [src/team/team.ts:316-344](file://src/team/team.ts#L316-L344)
 
 ## 结论
-Open Multi-Agent 提供了从单智能体到多智能体团队的全栈编排能力，通过统一的事件与追踪回调、灵活的工具系统与并发控制，满足复杂任务流水线与可观测性需求。推荐优先使用 runTeam 快速落地目标导向任务，或在需要精细控制时使用 runTasks 显式定义任务图。
+OpenMultiAgent 提供从单智能体到多智能体团队的全栈编排能力，通过清晰的类型系统与丰富的配置项，兼顾易用性与可控性。推荐在生产环境中结合预算控制、可观测性与审批门控，确保稳定与高效。
 
-## 附录：类型定义参考
+## 附录
 
-### 公共类型导出
-- 内容块与消息
-  - TextBlock、ToolUseBlock、ToolResultBlock、ImageBlock、ContentBlock
-  - LLMMessage、LLMResponse、TokenUsage
-- LLM 适配器
-  - LLMAdapter、LLMChatOptions、LLMStreamOptions、StreamEvent
-- 工具
-  - ToolDefinition、ToolResult、ToolUseContext、ToolRegistry、ToolExecutor、BatchToolCall
-- 智能体
-  - AgentConfig、AgentState、AgentRunResult、BeforeRunHookContext、ToolCallRecord、LoopDetectionConfig、LoopDetectionInfo
-- 团队
-  - TeamConfig、TeamRunResult、Message、MessageBus
-- 任务
-  - Task、TaskStatus、TaskQueue、TaskQueueEvent
-- 编排器
-  - OrchestratorConfig、OrchestratorEvent
-- 追踪
-  - TraceEventType、TraceEventBase、TraceEvent、LLMCallTrace、ToolCallTrace、TaskTrace、AgentTrace
-- 内存
-  - MemoryEntry、MemoryStore
+### 版本兼容性与迁移指南
+- 版本：当前发布版本为 1.4.1
+- Node.js：要求 >= 18.0.0
+- 迁移建议
+  - 从旧版升级：关注 OrchestratorEvent 新增的 task_skipped 字段，补充对应处理逻辑。
+  - 配置迁移：将原全局默认值迁移到 OrchestratorConfig.defaultXxx 与 AgentConfig.xxxx 的组合使用。
+  - 工具与适配器：如需自定义 LLMAdapter，请遵循 LLMAdapter 接口规范，确保 capabilities.echoesReasoning 正确声明。
 
 章节来源
-- [src/types.ts:14-543](file://src/types.ts#L14-L543)
-- [src/index.ts:122-182](file://src/index.ts#L122-L182)
-
-### 事件回调接口规范
-- onProgress(OrchestratorEvent)
-  - 触发时机：任务开始/完成、代理开始/完成、消息、错误、重试、跳过
-  - 事件类型：agent_start、agent_complete、task_start、task_complete、task_skipped、task_retry、message、error
-- onTrace(TraceEvent)
-  - 触发时机：每次 LLM 调用、工具执行、任务完成、代理运行结束
-  - 事件类型：llm_call、tool_call、task、agent
-- onApproval(completedTasks: readonly Task[], nextTasks: readonly Task[]): Promise<boolean>
-  - 触发时机：每轮任务完成后，存在下一轮任务时
-  - 行为：返回 true 继续，false 中止并标记剩余任务为 skipped
-
-章节来源
-- [src/types.ts:370-411](file://src/types.ts#L370-L411)
-- [src/orchestrator/orchestrator.ts:280-464](file://src/orchestrator/orchestrator.ts#L280-L464)
-- [tests/approval.test.ts:283-302](file://tests/approval.test.ts#L283-L302)
-
-### 错误处理与异常类型
-- Agent 钩子
-  - beforeRun 抛错：直接中止运行，返回失败结果
-  - afterRun 抛错：标记运行失败
-- 工具执行
-  - 工具异常捕获为 ToolResult(isError: true)，不影响对话循环
-- 审批门控
-  - 回调抛错：跳过剩余任务，标记 skipped
-- 循环检测
-  - terminate：立即终止当前轮次
-  - warn/inject：注入警告后继续，二次检测强制终止
-- 超时与取消
-  - timeoutMs：对单次 run/prompt/stream 设置 AbortSignal.timeout
-  - abortSignal：支持外部取消
-
-章节来源
-- [src/agent/agent.ts:357-371](file://src/agent/agent.ts#L357-L371)
-- [src/agent/runner.ts:495-498](file://src/agent/runner.ts#L495-L498)
-- [tests/agent-hooks.test.ts:112-124](file://tests/agent-hooks.test.ts#L112-L124)
-- [tests/approval.test.ts:304-317](file://tests/approval.test.ts#L304-L317)
-
-### 使用示例路径
-- 单智能体运行与流式输出：[examples/01-single-agent.ts:34-103](file://examples/01-single-agent.ts#L34-L103)
-- 团队协作与进度回调：[examples/02-team-collaboration.ts:128-167](file://examples/02-team-collaboration.ts#L128-L167)
-
-章节来源
-- [examples/01-single-agent.ts:34-103](file://examples/01-single-agent.ts#L34-L103)
-- [examples/02-team-collaboration.ts:128-167](file://examples/02-team-collaboration.ts#L128-L167)
+- [package.json:1-108](file://package.json#L1-L108)
+- [src/types.ts:741-755](file://src/types.ts#L741-L755)
