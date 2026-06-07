@@ -2,7 +2,7 @@
 
 Runnable scripts demonstrating `open-multi-agent`. Organized by category — pick one that matches what you're trying to do.
 
-All scripts run with `npx tsx examples/<category>/<name>.ts` and require the corresponding API key in your environment.
+All scripts run with `npx tsx examples/<category>/<name>.ts`. Scripts that call a model require the corresponding API key in your environment.
 
 ---
 
@@ -32,9 +32,17 @@ One example per supported provider. All follow the same three-agent (architect /
 | [`providers/grok`](providers/grok.ts) | xAI Grok | `XAI_API_KEY` |
 | [`providers/gemini`](providers/gemini.ts) | Google Gemini | `GEMINI_API_KEY` |
 | [`providers/minimax`](providers/minimax.ts) | MiniMax M2.7 | `MINIMAX_API_KEY` |
+| [`providers/mimo`](providers/mimo.ts) | MiMo V2.5 Pro | `MIMO_API_KEY` |
+| [`providers/hunyuan`](providers/hunyuan.ts) | Tencent Hunyuan (MaaS, hy3) | `HUNYUAN_API_KEY` |
 | [`providers/deepseek`](providers/deepseek.ts) | DeepSeek Chat | `DEEPSEEK_API_KEY` |
 | [`providers/openrouter`](providers/openrouter.ts) | OpenRouter (OpenAI-compatible) | `OPENROUTER_API_KEY` |
 | [`providers/groq`](providers/groq.ts) | Groq (OpenAI-compatible) | `GROQ_API_KEY` |
+| [`providers/mistral`](providers/mistral.ts) | Mistral (OpenAI-compatible) | `MISTRAL_API_KEY` |
+| [`providers/zhipu`](providers/zhipu.ts) | Zhipu GLM (OpenAI-compatible) | `ZHIPU_API_KEY` |
+| [`providers/doubao`](providers/doubao.ts) | Doubao / ByteDance (OpenAI-compatible) | `ARK_API_KEY` |
+| [`providers/qiniu`](providers/qiniu.ts) | Qiniu (OpenAI-compatible) | `QINIU_API_KEY` |
+| [`providers/qwen`](providers/qwen.ts) | Qwen / DashScope (OpenAI-compatible) | `DASHSCOPE_API_KEY` |
+| [`providers/moonshot`](providers/moonshot.ts) | Moonshot AI / Kimi (OpenAI-compatible) | `MOONSHOT_API_KEY` |
 
 ## patterns — orchestration patterns
 
@@ -49,6 +57,8 @@ Reusable shapes for common multi-agent problems.
 | [`patterns/research-aggregation`](patterns/research-aggregation.ts) | Multi-source research collated by a synthesis agent. |
 | [`patterns/cost-tiered-pipeline`](patterns/cost-tiered-pipeline.ts) | Run the same four-stage pipeline twice to compare flagship vs tiered model cost. |
 | [`patterns/agent-handoff`](patterns/agent-handoff.ts) | Synchronous sub-agent delegation via `delegate_to_agent`. |
+| [`patterns/plan-replay`](patterns/plan-replay.ts) | Pin a coordinator plan with `createPlanArtifact`, then replay it with `runFromPlan`, no coordinator re-run. |
+
 ## cookbook — use-case recipes
 
 End-to-end examples framed around a concrete problem (meeting summarization, translation QA, competitive monitoring, etc.) rather than a single orchestration primitive. Lighter bar than `production/`: no tests or pinned model versions required. Good entry point if you want to see how the patterns compose on a real task.
@@ -71,6 +81,7 @@ Hooking the framework up to outside-the-box tooling.
 |---------|-----------------|
 | [`integrations/trace-observability`](integrations/trace-observability.ts) | `onTrace` spans for LLM calls, tools, and tasks. |
 | [`integrations/mcp-github`](integrations/mcp-github.ts) | An MCP server's tools exposed to an agent via `connectMCPTools()`. |
+| [`integrations/mcp-bilig-workpaper`](integrations/mcp-bilig-workpaper.ts) | Bilig WorkPaper MCP tools for formula readback, recalculation, and persisted workbook JSON. |
 | [`integrations/with-vercel-ai-sdk/`](integrations/with-vercel-ai-sdk/) | Next.js app — OMA `runTeam()` + AI SDK `useChat` streaming. |
 | [`integrations/express-customer-support/`](integrations/express-customer-support/) | Express REST API — `runTasks()` behind POST /tickets with per-agent Zod output schemas, mix-and-match provider env vars, and HTTP error mapping (400/502/504). |
 

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { mkdtemp, rm, writeFile, readFile } from 'fs/promises'
+import { access, mkdir, mkdtemp, rm, symlink, writeFile, readFile } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { fileReadTool } from '../src/tool/built-in/file-read.js'
@@ -13,6 +13,10 @@ import {
   BUILT_IN_TOOLS,
   delegateToAgentTool,
 } from '../src/tool/built-in/index.js'
+import {
+  DEFAULT_WORKSPACE_DIRNAME,
+  defaultWorkspaceDir,
+} from '../src/tool/built-in/path-safety.js'
 import { ToolRegistry } from '../src/tool/framework.js'
 import { InMemoryStore } from '../src/memory/store.js'
 import type { AgentRunResult, ToolUseContext } from '../src/types.js'
@@ -21,14 +25,28 @@ import type { AgentRunResult, ToolUseContext } from '../src/types.js'
 // Helpers
 // ---------------------------------------------------------------------------
 
-const defaultContext: ToolUseContext = {
-  agent: { name: 'test-agent', role: 'tester', model: 'test' },
+let tmpDir: string
+let defaultContext: ToolUseContext
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`
 }
 
-let tmpDir: string
+async function fileExists(path: string): Promise<boolean> {
+  try {
+    await access(path)
+    return true
+  } catch {
+    return false
+  }
+}
 
 beforeEach(async () => {
   tmpDir = await mkdtemp(join(tmpdir(), 'oma-test-'))
+  defaultContext = {
+    agent: { name: 'test-agent', role: 'tester', model: 'test' },
+    cwd: tmpDir,
+  }
 })
 
 afterEach(async () => {
@@ -317,6 +335,224 @@ describe('bash', () => {
     expect(result.isError).toBe(false)
     expect(result.data).toContain('command completed with no output')
   })
+
+  it('does not pass provider secrets from process.env into the shell', async () => {
+    const original = process.env['OPENAI_API_KEY']
+    process.env['OPENAI_API_KEY'] = 'sk-envsecretvalue1234567890'
+    try {
+      const result = await bashTool.execute(
+        { command: 'printf "%s" "$OPENAI_API_KEY"' },
+        defaultContext,
+      )
+
+      expect(result.isError).toBe(false)
+      expect(result.data).not.toContain('sk-envsecretvalue1234567890')
+    } finally {
+      if (original === undefined) {
+        delete process.env['OPENAI_API_KEY']
+      } else {
+        process.env['OPENAI_API_KEY'] = original
+      }
+    }
+  })
+
+  it('redacts sensitive-looking command output', async () => {
+    const result = await bashTool.execute(
+      { command: 'printf "OPENAI_API_KEY=sk-outputsecretvalue1234567890"' },
+      defaultContext,
+    )
+
+    expect(result.isError).toBe(false)
+    expect(result.data).toContain('[redacted]')
+    expect(result.data).not.toContain('sk-outputsecretvalue1234567890')
+  })
+
+  it('kills background child processes on timeout', async () => {
+    const marker = join(tmpDir, 'background-child.txt')
+
+    const result = await bashTool.execute(
+      {
+        command: `(sleep 0.4; echo alive > ${shellQuote(marker)}) & sleep 5`,
+        timeout: 100,
+      },
+      defaultContext,
+    )
+
+    expect(result.isError).toBe(true)
+    expect(result.data).toContain('124')
+
+    // The backgrounded child would have written the marker after 400 ms if it
+    // had outlived the parent. Give it more than that and verify nothing was
+    // written.
+    await new Promise((resolve) => setTimeout(resolve, 700))
+    expect(await fileExists(marker)).toBe(false)
+  })
+})
+
+// ===========================================================================
+// filesystem sandbox
+// ===========================================================================
+
+describe('filesystem sandbox', () => {
+  it('rejects relative paths in file_read', async () => {
+    const result = await fileReadTool.execute(
+      { path: 'relative.txt' },
+      defaultContext,
+    )
+
+    expect(result.isError).toBe(true)
+    expect(result.data).toContain('must be absolute')
+  })
+
+  it('rejects file_write outside the sandbox root', async () => {
+    const result = await fileWriteTool.execute(
+      { path: join(tmpdir(), 'oma-outside-write.txt'), content: 'outside' },
+      defaultContext,
+    )
+
+    expect(result.isError).toBe(true)
+    expect(result.data).toContain("outside the agent's working directory")
+  })
+
+  it('rejects file_edit outside the sandbox root', async () => {
+    const result = await fileEditTool.execute(
+      {
+        path: join(tmpdir(), 'oma-outside-edit.txt'),
+        old_string: 'x',
+        new_string: 'y',
+      },
+      defaultContext,
+    )
+
+    expect(result.isError).toBe(true)
+    expect(result.data).toContain("outside the agent's working directory")
+  })
+
+  it('opts out when cwd is null (relative paths and arbitrary roots accepted)', async () => {
+    const optOut: ToolUseContext = {
+      agent: { name: 'test-agent', role: 'tester', model: 'test' },
+      cwd: null,
+    }
+
+    // Relative path no longer rejected up front.
+    const relResult = await fileReadTool.execute(
+      { path: 'still-relative.txt' },
+      optOut,
+    )
+    expect(relResult.data).not.toContain('must be absolute')
+
+    // Absolute path outside any sandbox root is accepted (still fails because
+    // the file does not exist, but with a fs error rather than a sandbox error).
+    const absResult = await fileReadTool.execute(
+      { path: join(tmpdir(), 'oma-opt-out-missing.txt') },
+      optOut,
+    )
+    expect(absResult.data).not.toContain("outside the agent's working directory")
+  })
+
+  it('defaultWorkspaceDir resolves to <cwd>/.agent-workspace', () => {
+    expect(DEFAULT_WORKSPACE_DIRNAME).toBe('.agent-workspace')
+    expect(defaultWorkspaceDir()).toBe(join(process.cwd(), '.agent-workspace'))
+  })
+
+  it('auto-creates the sandbox root on first write when missing', async () => {
+    // Point cwd at a path that does not yet exist. file_write should still
+    // succeed because the sandbox layer mkdir -p's the root on first use.
+    const freshRoot = join(tmpDir, 'fresh-workspace')
+    const ctx: ToolUseContext = {
+      agent: { name: 'test-agent', role: 'tester', model: 'test' },
+      cwd: freshRoot,
+    }
+
+    expect(await fileExists(freshRoot)).toBe(false)
+
+    const result = await fileWriteTool.execute(
+      { path: join(freshRoot, 'hello.txt'), content: 'hi' },
+      ctx,
+    )
+
+    expect(result.isError).toBe(false)
+    expect(await fileExists(freshRoot)).toBe(true)
+    expect(await readFile(join(freshRoot, 'hello.txt'), 'utf8')).toBe('hi')
+  })
+
+  it('falls back to defaultWorkspaceDir when ToolUseContext omits cwd', async () => {
+    // High-level callers (OpenMultiAgent / Agent / AgentRunner) inject a
+    // cwd into ToolUseContext. Low-level callers that go straight to the
+    // exported tool functions (fileReadTool.execute, etc.) may omit it.
+    // In that case the sandbox layer must still narrow to
+    // `<process.cwd()>/.agent-workspace`, not silently fall back to
+    // `process.cwd()` (which would expose the entire host project).
+    const ctx: ToolUseContext = {
+      agent: { name: 'test-agent', role: 'tester', model: 'test' },
+      // cwd intentionally omitted
+    }
+
+    const result = await fileReadTool.execute(
+      { path: join(process.cwd(), 'package.json') },
+      ctx,
+    )
+
+    expect(result.isError).toBe(true)
+    // Whether the .agent-workspace directory happens to exist or not,
+    // the error must reference it (either as the missing root or as the
+    // sandbox root the candidate is outside of).
+    expect(result.data).toContain('.agent-workspace')
+  })
+
+  it('does not auto-create the sandbox root when read-only tools see a missing root', async () => {
+    // file_read, file_edit, grep, and glob must not silently create the
+    // sandbox root on a caller's behalf. Only file_write opts into that
+    // behaviour via `ensureRoot: true`.
+    const freshRoot = join(tmpDir, 'readonly-fresh-workspace')
+    const ctx: ToolUseContext = {
+      agent: { name: 'test-agent', role: 'tester', model: 'test' },
+      cwd: freshRoot,
+    }
+
+    expect(await fileExists(freshRoot)).toBe(false)
+
+    const result = await fileReadTool.execute(
+      { path: join(freshRoot, 'whatever.txt') },
+      ctx,
+    )
+
+    expect(result.isError).toBe(true)
+    expect(result.data).toContain('Could not resolve working directory')
+    expect(await fileExists(freshRoot)).toBe(false)
+  })
+
+  it('default workspace root prevents reading parent-directory files (L2-b core benefit)', async () => {
+    // Simulate the real default-cwd scenario: the agent's sandbox root is
+    // a `.agent-workspace` subdirectory inside an enclosing project root.
+    // Files in the enclosing root (e.g. .env, source files) must not be
+    // reachable just because the host happened to launch from there.
+    const projectRoot = await mkdtemp(join(tmpdir(), 'oma-project-'))
+    try {
+      await writeFile(join(projectRoot, '.env'), 'SECRET=do-not-leak')
+
+      // Pre-create the workspace root so this test exercises the
+      // outside-root rejection path rather than the missing-root path.
+      const workspaceRoot = join(projectRoot, DEFAULT_WORKSPACE_DIRNAME)
+      await mkdir(workspaceRoot, { recursive: true })
+
+      const ctx: ToolUseContext = {
+        agent: { name: 'test-agent', role: 'tester', model: 'test' },
+        cwd: workspaceRoot,
+      }
+
+      const result = await fileReadTool.execute(
+        { path: join(projectRoot, '.env') },
+        ctx,
+      )
+
+      expect(result.isError).toBe(true)
+      expect(result.data).toContain("outside the agent's working directory")
+      expect(result.data).not.toContain('SECRET=do-not-leak')
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true })
+    }
+  })
 })
 
 // ===========================================================================
@@ -375,7 +611,6 @@ describe('glob', () => {
 
   it('recurses into subdirectories', async () => {
     const sub = join(tmpDir, 'nested')
-    const { mkdir } = await import('fs/promises')
     await mkdir(sub, { recursive: true })
     await writeFile(join(sub, 'deep.ts'), '')
 
@@ -388,9 +623,54 @@ describe('glob', () => {
     expect(result.data).toContain('deep.ts')
   })
 
+  it('does not follow symlinked directories outside the sandbox root', async () => {
+    const root = join(tmpDir, 'root')
+    const outside = join(tmpDir, 'outside')
+    await mkdir(root, { recursive: true })
+    await mkdir(outside, { recursive: true })
+    await writeFile(join(root, 'safe.ts'), 'safe')
+    await writeFile(join(outside, 'secret.ts'), 'secret')
+    await symlink(outside, join(root, 'linked-outside'))
+
+    const result = await globTool.execute(
+      { path: root, pattern: '*.ts' },
+      {
+        ...defaultContext,
+        cwd: root,
+      },
+    )
+
+    expect(result.isError).toBe(false)
+    expect(result.data).toContain('safe.ts')
+    expect(result.data).not.toContain('secret.ts')
+    expect(result.data).not.toContain('linked-outside')
+  })
+
+  it('does not follow symlinks to files outside the sandbox root', async () => {
+    const root = join(tmpDir, 'root')
+    const outside = join(tmpDir, 'outside')
+    await mkdir(root, { recursive: true })
+    await mkdir(outside, { recursive: true })
+    await writeFile(join(root, 'safe.ts'), 'safe')
+    await writeFile(join(outside, 'secret.ts'), 'secret')
+    await symlink(join(outside, 'secret.ts'), join(root, 'linked-secret.ts'))
+
+    const result = await globTool.execute(
+      { path: root, pattern: '*.ts' },
+      {
+        ...defaultContext,
+        cwd: root,
+      },
+    )
+
+    expect(result.isError).toBe(false)
+    expect(result.data).toContain('safe.ts')
+    expect(result.data).not.toContain('linked-secret.ts')
+  })
+
   it('errors on inaccessible path', async () => {
     const result = await globTool.execute(
-      { path: '/nonexistent/path/xyz' },
+      { path: join(tmpDir, 'missing') },
       defaultContext,
     )
 
@@ -461,8 +741,6 @@ describe('grep', () => {
   it('searches recursively in a directory', async () => {
     const subDir = join(tmpDir, 'sub')
     await writeFile(join(tmpDir, 'a.txt'), 'findme here\n')
-    // Create subdir and file
-    const { mkdir } = await import('fs/promises')
     await mkdir(subDir, { recursive: true })
     await writeFile(join(subDir, 'b.txt'), 'findme there\n')
 
@@ -490,9 +768,58 @@ describe('grep', () => {
     expect(result.data).not.toContain('readme.md')
   })
 
+  // Both branches must reject the symlink — ripgrep defaults to --no-follow,
+  // and the Node.js fallback skips symlinks via lstat() in fs-walk.
+  it('does not follow symlinked directories outside the sandbox root', async () => {
+    const root = join(tmpDir, 'root')
+    const outside = join(tmpDir, 'outside')
+    await mkdir(root, { recursive: true })
+    await mkdir(outside, { recursive: true })
+    await writeFile(join(root, 'safe.ts'), 'needle inside\n')
+    await writeFile(join(outside, 'secret.ts'), 'needle outside\n')
+    await symlink(outside, join(root, 'linked-outside'))
+
+    const result = await grepTool.execute(
+      { pattern: 'needle', path: root },
+      {
+        ...defaultContext,
+        cwd: root,
+      },
+    )
+
+    expect(result.isError).toBe(false)
+    expect(result.data).toContain('needle inside')
+    expect(result.data).not.toContain('needle outside')
+    expect(result.data).not.toContain('secret.ts')
+    expect(result.data).not.toContain('linked-outside')
+  })
+
+  it('does not follow symlinks to files outside the sandbox root', async () => {
+    const root = join(tmpDir, 'root')
+    const outside = join(tmpDir, 'outside')
+    await mkdir(root, { recursive: true })
+    await mkdir(outside, { recursive: true })
+    await writeFile(join(root, 'safe.ts'), 'needle inside\n')
+    await writeFile(join(outside, 'secret.ts'), 'needle outside\n')
+    await symlink(join(outside, 'secret.ts'), join(root, 'linked-secret.ts'))
+
+    const result = await grepTool.execute(
+      { pattern: 'needle', path: root },
+      {
+        ...defaultContext,
+        cwd: root,
+      },
+    )
+
+    expect(result.isError).toBe(false)
+    expect(result.data).toContain('needle inside')
+    expect(result.data).not.toContain('needle outside')
+    expect(result.data).not.toContain('linked-secret.ts')
+  })
+
   it('errors on inaccessible path', async () => {
     const result = await grepTool.execute(
-      { pattern: 'test', path: '/nonexistent/path/xyz' },
+      { pattern: 'test', path: join(tmpDir, 'missing') },
       defaultContext,
     )
 

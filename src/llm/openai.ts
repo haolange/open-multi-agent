@@ -56,7 +56,10 @@ import {
   normalizeFinishReason,
   buildOpenAIMessageList,
   getOpenAIReasoningText,
+  repairToolArgs,
 } from './openai-common.js'
+import { assertValidMessages } from './validate.js'
+import type { ReasoningOutboundOptions } from './reasoning-fallback.js'
 import { extractToolCallsFromText } from '../tool/text-tool-extractor.js'
 
 // ---------------------------------------------------------------------------
@@ -71,11 +74,20 @@ import { extractToolCallsFromText } from '../tool/text-tool-extractor.js'
 export class OpenAIAdapter implements LLMAdapter {
   readonly name: string = 'openai'
 
-  readonly capabilities = {
-    // OpenAI Chat Completions does not accept `reasoning_content` on input;
-    // any reasoning replay must go through the `<thinking>` text fallback
-    // already shipped in #234 (see openai-common.ts replay options).
-    echoesReasoning: 'never' as const,
+  // The field type is intentionally widened to the full union (rather than
+  // narrowed to `'never'` via `as const`) so subclasses can override with a
+  // different value — DeepSeek currently uses `'tool-use-only'` for native
+  // `reasoning_content` echo on tool-use turns (per PR #251).
+  //
+  // OpenAI itself stays `'never'`: Chat Completions does not accept
+  // `reasoning_content` on input under any circumstance. When the user sets
+  // `AgentConfig.preserveReasoningAsText` (PR #260 / #223 Phase 2), the
+  // outbound conversion in `toOpenAIMessages` downgrades each reasoning
+  // block to inline `<thinking>` text via the shared helper in
+  // `reasoning-fallback.ts`. Without the opt-in, reasoning blocks are
+  // dropped silently on outbound.
+  readonly capabilities: { readonly echoesReasoning: 'never' | 'own-issued' | 'tool-use-only' } = {
+    echoesReasoning: 'never',
   }
 
   readonly #client: OpenAI
@@ -85,6 +97,36 @@ export class OpenAIAdapter implements LLMAdapter {
       apiKey: apiKey ?? process.env['OPENAI_API_KEY'],
       baseURL,
     })
+  }
+
+  /**
+   * Build the per-call options forwarded to {@link buildOpenAIMessageList}.
+   *
+   * Composes two orthogonal mechanisms:
+   *  1. **`nativeReasoningEchoProvider`** — set when this adapter's
+   *     capability is `'tool-use-only'` (DeepSeek). Triggers native
+   *     `reasoning_content` echo on assistant messages whose reasoning
+   *     blocks carry matching provenance AND the conversation contains
+   *     `tool_use`. See PR #251 / DeepSeek V4 thinking-mode spec.
+   *  2. **`preserveReasoningAsText` / `compressReasoningText`** — opt-in
+   *     `<thinking>` text fallback from the user's `AgentConfig`. Applies
+   *     to foreign-provenance reasoning AND to all reasoning on `'never'`
+   *     adapters. See #223 Phase 2.
+   *
+   * The two paths are mutually exclusive per block: native echo claims
+   * own-provenance blocks first; text fallback claims everything else.
+   * Subclasses inherit `chat()` / `stream()` and so automatically pick up
+   * both behaviours; no subclass override needed.
+   */
+  protected buildMessageOptions(options: LLMChatOptions): ReasoningOutboundOptions | undefined {
+    const wantsNativeEcho = this.capabilities.echoesReasoning === 'tool-use-only'
+    const wantsTextFallback = options.preserveReasoningAsText === true
+    if (!wantsNativeEcho && !wantsTextFallback) return undefined
+    return {
+      preserveReasoningAsText: options.preserveReasoningAsText,
+      compressReasoningText: options.compressReasoningText,
+      nativeReasoningEchoProvider: wantsNativeEcho ? this.name : undefined,
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -99,7 +141,8 @@ export class OpenAIAdapter implements LLMAdapter {
    * handle these (e.g. rate limits, context length exceeded).
    */
   async chat(messages: LLMMessage[], options: LLMChatOptions): Promise<LLMResponse> {
-    const openAIMessages = buildOpenAIMessageList(messages, options.systemPrompt)
+    assertValidMessages(messages)
+    const openAIMessages = buildOpenAIMessageList(messages, options.systemPrompt, this.buildMessageOptions(options))
 
     const completion = await this.#client.chat.completions.create(
       {
@@ -151,7 +194,8 @@ export class OpenAIAdapter implements LLMAdapter {
     messages: LLMMessage[],
     options: LLMStreamOptions,
   ): AsyncIterable<StreamEvent> {
-    const openAIMessages = buildOpenAIMessageList(messages, options.systemPrompt)
+    assertValidMessages(messages)
+    const openAIMessages = buildOpenAIMessageList(messages, options.systemPrompt, this.buildMessageOptions(options))
 
     // We request usage in the final chunk so we can include it in the `done` event.
     const streamResponse = await this.#client.chat.completions.create(
@@ -264,7 +308,8 @@ export class OpenAIAdapter implements LLMAdapter {
             parsedInput = parsed as Record<string, unknown>
           }
         } catch {
-          // Malformed JSON — surface as empty object.
+          const repaired = repairToolArgs(buf.argsJson)
+          if (repaired) parsedInput = repaired
         }
 
         const toolUseBlock: ToolUseBlock = {

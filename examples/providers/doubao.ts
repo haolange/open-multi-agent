@@ -2,7 +2,7 @@
  * Multi-Agent Team Collaboration with Doubao (ByteDance)
  *
  * Three specialized agents (architect, developer, reviewer) collaborate via `runTeam()`
- * to build a minimal Express.js REST API. Every agent uses Doubao via the OpenAI-compatible adapter.
+ * to build a minimal Express.js REST API. Every agent uses the built-in Doubao provider shortcut.
  *
  * Run:
  *   npx tsx examples/providers/doubao.ts
@@ -11,14 +11,18 @@
  *   ARK_API_KEY environment variable must be set.
  *
  * Available models:
- *   doubao-1-5-pro-32k-250115  — Doubao 1.5 production model (recommended for coding tasks)
- *   doubao-1-5-lite-32k-250115 — Doubao 1.5 lightweight model (faster, lower cost)
+ *   doubao-seed-1-8-251228 — Doubao Seed 1.8 model
  */
 
+import { join } from 'node:path'
 import { OpenMultiAgent } from '../../src/index.js'
 import type { AgentConfig, OrchestratorEvent } from '../../src/types.js'
 
-const DOUBAO_BASE_URL = 'https://ark.cn-beijing.volces.com/api/v3'
+// Built-in filesystem tools are sandboxed to `<cwd>/.agent-workspace` by
+// default; route generated output there so the demo runs without
+// disabling the sandbox.
+const OUTPUT_DIR = join(process.cwd(), '.agent-workspace', 'doubao-api')
+
 const DOUBAO_API_KEY = process.env.ARK_API_KEY
 
 if (!DOUBAO_API_KEY) {
@@ -26,13 +30,12 @@ if (!DOUBAO_API_KEY) {
 }
 
 // ---------------------------------------------------------------------------
-// Agent definitions (all using Doubao via the OpenAI-compatible adapter)
+// Agent definitions (all using Doubao via the built-in provider shortcut)
 // ---------------------------------------------------------------------------
 const architect: AgentConfig = {
   name: 'architect',
-  model: 'doubao-1-5-pro-32k-250115',
-  provider: 'openai',
-  baseURL: DOUBAO_BASE_URL,
+  model: 'doubao-seed-1-8-251228',
+  provider: 'doubao',
   apiKey: DOUBAO_API_KEY,
   systemPrompt: `You are a software architect with deep experience in Node.js and REST API design.
 Your job is to design clear, production-quality API contracts and file/directory structures.
@@ -44,9 +47,8 @@ Output concise plans in markdown — no unnecessary prose.`,
 
 const developer: AgentConfig = {
   name: 'developer',
-  model: 'doubao-1-5-pro-32k-250115',
-  provider: 'openai',
-  baseURL: DOUBAO_BASE_URL,
+  model: 'doubao-seed-1-8-251228',
+  provider: 'doubao',
   apiKey: DOUBAO_API_KEY,
   systemPrompt: `You are a TypeScript/Node.js developer. You implement what the architect specifies.
 Write clean, runnable code with proper error handling. Use the tools to write files and run tests.`,
@@ -57,9 +59,8 @@ Write clean, runnable code with proper error handling. Use the tools to write fi
 
 const reviewer: AgentConfig = {
   name: 'reviewer',
-  model: 'doubao-1-5-lite-32k-250115',
-  provider: 'openai',
-  baseURL: DOUBAO_BASE_URL,
+  model: 'doubao-seed-1-8-251228',
+  provider: 'doubao',
   apiKey: DOUBAO_API_KEY,
   systemPrompt: `You are a senior code reviewer. Review code for correctness, security, and clarity.
 Provide a structured review with: LGTM items, suggestions, and any blocking issues.
@@ -106,9 +107,8 @@ function handleProgress(event: OrchestratorEvent): void {
 // Orchestrate
 // ---------------------------------------------------------------------------
 const orchestrator = new OpenMultiAgent({
-  defaultModel: 'doubao-1-5-pro-32k-250115',
-  defaultProvider: 'openai',
-  defaultBaseURL: DOUBAO_BASE_URL,
+  defaultModel: 'doubao-seed-1-8-251228',
+  defaultProvider: 'doubao',
   defaultApiKey: DOUBAO_API_KEY,
   maxConcurrency: 1, // sequential for readable output
   onProgress: handleProgress,
@@ -125,7 +125,7 @@ console.log(`Team "${team.name}" created with agents: ${team.getAgents().map(a =
 console.log('\nStarting team run...\n')
 console.log('='.repeat(60))
 
-const goal = `Create a minimal Express.js REST API in /tmp/doubao-api/ with:
+const goal = `Create a minimal Express.js REST API in ${OUTPUT_DIR}/ with:
 - GET /health → { status: "ok" }
 - GET /users → returns a hardcoded array of 2 user objects
 - POST /users → accepts { name, email } body, logs it, returns 201

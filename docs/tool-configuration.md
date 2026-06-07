@@ -42,6 +42,58 @@ const customAgent: AgentConfig = {
 
 **Resolution order:** preset → allowlist → denylist → framework safety rails.
 
+## Filesystem Working Directory
+
+Built-in filesystem tools (`file_read`, `file_write`, `file_edit`, `grep`, `glob`) are sandboxed to a per-agent working directory. Paths must be absolute and resolve inside that directory; symlinks are resolved before the check so they cannot escape the configured root.
+
+> **`bash` is not sandboxed.** Once an agent has a shell, any `cd /etc`, absolute path, or subshell trivially escapes a per-tool path check. The sandbox is therefore best understood as **path containment for built-in filesystem tools**, not a security boundary against arbitrary command execution. If full path containment matters, drop `bash` via `disallowedTools: ['bash']` (or omit it from your `tools` allowlist) and rely on the filesystem tools. Process-level isolation (containers, seatbelt, firejail) is the right tool for an actually-untrusted shell.
+
+### Three typical configurations
+
+```typescript
+import { OpenMultiAgent } from '@open-multi-agent/core'
+
+// 1. Default — sandbox rooted at `<cwd>/.agent-workspace`.
+//    The directory is auto-created on first write. Agents cannot read or
+//    write outside that subdirectory, which keeps source files, `.env`,
+//    `.git/`, and `node_modules` off-limits even when the host launched
+//    from the repo root.
+const defaultOrchestrator = new OpenMultiAgent()
+
+// 2. Widen the sandbox to the entire current working directory.
+//    Useful when the agent is a coding assistant operating on the user's
+//    project (the host already established trust by launching there).
+const wideOrchestrator = new OpenMultiAgent({
+  defaultCwd: process.cwd(),
+})
+
+// 3. Disable the sandbox entirely (relative and absolute paths anywhere).
+const unrestrictedOrchestrator = new OpenMultiAgent({
+  defaultCwd: null,
+})
+```
+
+### Custom sandbox root
+
+```typescript
+const orchestrator = new OpenMultiAgent({
+  defaultCwd: '/var/run/my-agent-workspace', // any absolute path
+})
+
+const agent: AgentConfig = {
+  name: 'editor',
+  model: 'claude-sonnet-4-6',
+  toolPreset: 'readwrite',
+  cwd: '/var/run/my-agent-workspace/packages/app', // optional per-agent override
+}
+```
+
+**Resolution order.** `AgentConfig.cwd` (if set) → `OrchestratorConfig.defaultCwd` (if set) → `<process.cwd()>/.agent-workspace`. Pass `null` at either level to disable the sandbox for that scope.
+
+**Auto-creation.** The sandbox root is `mkdir -p`'d on first write, so callers do not need to pre-create `.agent-workspace` (or any custom path).
+
+The `bash` tool runs in its own process group on POSIX, so timeouts and abort signals kill any backgrounded children rather than letting them outlive the parent.
+
 ## Custom Tools
 
 Two ways to give an agent a tool that is not in the built-in set.
@@ -134,8 +186,12 @@ import { connectMCPTools } from '@open-multi-agent/core/mcp'
 
 const { tools, disconnect } = await connectMCPTools({
   command: 'npx',
-  args: ['-y', '@modelcontextprotocol/server-github'],
-  env: { GITHUB_TOKEN: process.env.GITHUB_TOKEN },
+  args: ['--no-install', '@modelcontextprotocol/server-github'],
+  env: {
+    GITHUB_TOKEN: process.env.GITHUB_TOKEN,
+    HOME: process.env.HOME,
+    PATH: process.env.PATH,
+  },
   namePrefix: 'github',
 })
 
@@ -148,5 +204,6 @@ Notes:
 - `@modelcontextprotocol/sdk` is an optional peer dependency, only needed when using MCP.
 - Current transport support is stdio.
 - MCP input validation is delegated to the MCP server (`inputSchema` is `z.any()`).
+- Prefer locally installed or pinned MCP server binaries and pass only the environment variables that server needs. Avoid spreading `process.env` into MCP subprocesses.
 
 See [`integrations/mcp-github`](../examples/integrations/mcp-github.ts) for a full runnable setup.

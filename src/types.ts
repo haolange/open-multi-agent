@@ -227,8 +227,17 @@ export interface ToolUseContext {
    * Tools should prefer `abortSignal` for simple cancellation checks.
    */
   readonly abortController?: AbortController
-  /** Working directory hint for file-system tools. */
-  readonly cwd?: string
+  /**
+   * Working directory for filesystem-tool sandboxing.
+   *
+   * - `string` — built-in filesystem tools (`file_read`, `file_write`,
+   *   `file_edit`, `grep`, `glob`) require absolute paths and reject paths
+   *   that resolve outside this directory (including via symlinks).
+   * - `null` — sandbox is explicitly disabled; tools accept arbitrary paths.
+   * - `undefined` — falls back to `<process.cwd()>/.agent-workspace`, an
+   *   auto-created sandbox subdirectory (sandbox enabled).
+   */
+  readonly cwd?: string | null
   /** Arbitrary caller-supplied metadata (session ID, request ID, etc.). */
   readonly metadata?: Readonly<Record<string, unknown>>
 }
@@ -402,6 +411,16 @@ export interface AgentConfig {
   readonly disallowedTools?: readonly string[]
   /** Predefined tool preset for common use cases. */
   readonly toolPreset?: 'readonly' | 'readwrite' | 'full'
+  /**
+   * Root directory used by built-in filesystem tools (`file_read`,
+   * `file_write`, `file_edit`, `grep`, `glob`). Paths must be absolute and
+   * resolve inside this directory; symlinks are resolved before the check.
+   *
+   * Defaults to {@link OrchestratorConfig.defaultCwd} (or
+   * `<process.cwd()>/.agent-workspace` if neither is set). Pass `null` to
+   * disable the sandbox for this agent.
+   */
+  readonly cwd?: string | null
   readonly maxTurns?: number
   readonly maxTokens?: number
   /** Maximum cumulative tokens (input + output) allowed for this run. */
@@ -506,6 +525,59 @@ export interface AgentConfig {
    * Error tool results are never compressed.
    */
   readonly compressToolResults?: boolean | { readonly minChars?: number }
+  /**
+   * Opt-in: when an outbound IR-to-native conversion encounters a
+   * {@link ReasoningBlock} that the target adapter cannot natively echo
+   * (see {@link LLMAdapter.capabilities.echoesReasoning}), downgrade the
+   * block to `<thinking>...</thinking>` text and prepend to the next text
+   * part instead of dropping it silently (today's default).
+   *
+   * Triggers in two scenarios:
+   *  1. **Same-provider replay** through a `'never'` adapter (e.g. an
+   *     OpenAI o-series response carries `reasoning_content` that gets
+   *     extracted to a `ReasoningBlock`; on the next turn it would
+   *     normally be dropped because Chat Completions doesn't accept
+   *     reasoning input).
+   *  2. **Cross-provider handoff** — `Agent.prompt()` switching `model`
+   *     mid-conversation, or any other path that puts a block from one
+   *     provider in front of another adapter.
+   *
+   * Default `false` because enabling silently inflates prompt tokens
+   * (reasoning blocks can be very long) and emits the model's internal
+   * thinking text to potentially different providers, both of which the
+   * user should consent to. See #223 for the design discussion.
+   *
+   * Caveat: some OpenAI-compatible local models echo `<thinking>` text
+   * back as if it were instruction, which can trip the loop detector —
+   * see `examples/patterns/cross-provider-reasoning.ts`.
+   */
+  readonly preserveReasoningAsText?: boolean
+  /**
+   * Truncate the inner text of each `<thinking>` block emitted by the
+   * {@link preserveReasoningAsText} fallback. Shares the
+   * `boolean | { minChars?: number }` shape with
+   * {@link compressToolResults}, but **the compression method differs**:
+   *
+   *   - `compressToolResults`: blocks over the threshold are *replaced*
+   *     wholesale with a short marker string.
+   *   - `compressReasoningText`: blocks over the threshold are kept but
+   *     reduced to a head+tail excerpt that fits within `minChars`. The
+   *     same number serves as both the activation threshold AND the cap on
+   *     the post-truncation length.
+   *
+   * Values:
+   * - `true` — enable with default 1200-char head+tail excerpt.
+   * - `{ minChars: N }` — pass blocks of length ≤ N untouched; truncate
+   *   longer blocks to fit within N chars.
+   * - `false` — never truncate (footgun for long CoT, not recommended).
+   * - `undefined` — defaults to `true` when {@link preserveReasoningAsText}
+   *   is `true`, else `false`. Matches the maintainer's guidance in #223
+   *   to "tie compress default-on to the preserve flag".
+   *
+   * Has no effect when {@link preserveReasoningAsText} is `false` (no
+   * fallback runs, so nothing to truncate).
+   */
+  readonly compressReasoningText?: boolean | { readonly minChars?: number }
   /**
    * Optional Zod schema for structured output.  When set, the agent's final
    * output is parsed as JSON and validated against this schema.  A single
@@ -672,6 +744,29 @@ export interface TeamRunResult {
   readonly totalTokenUsage: TokenUsage
 }
 
+/** A single serializable task in a deterministic replay plan. */
+export interface PlanTaskArtifact {
+  readonly id: string
+  readonly title: string
+  readonly description: string
+  readonly assignee?: string
+  readonly dependsOn?: readonly string[]
+  readonly memoryScope?: 'dependencies' | 'all'
+  readonly maxRetries?: number
+  readonly retryDelayMs?: number
+  readonly retryBackoff?: number
+}
+
+/**
+ * Serializable plan artifact that can be persisted and later replayed without
+ * invoking the coordinator again.
+ */
+export interface PlanArtifact {
+  readonly version: 1
+  readonly goal?: string
+  readonly tasks: readonly PlanTaskArtifact[]
+}
+
 // ---------------------------------------------------------------------------
 // Task
 // ---------------------------------------------------------------------------
@@ -698,6 +793,16 @@ export interface TaskExecutionRecord {
   readonly assignee?: string
   readonly status: TaskStatus
   readonly dependsOn: readonly string[]
+  readonly description?: string
+  /**
+   * Execution config, carried so a `planOnly` snapshot can be serialized into a
+   * lossless replay artifact (see {@link PlanTaskArtifact}). Populated from the
+   * task; `undefined` when the task did not set them.
+   */
+  readonly memoryScope?: 'dependencies' | 'all'
+  readonly maxRetries?: number
+  readonly retryDelayMs?: number
+  readonly retryBackoff?: number
   readonly metrics?: TaskExecutionMetrics
 }
 
@@ -768,6 +873,15 @@ export interface OrchestratorConfig {
   readonly defaultProvider?: SupportedProvider
   readonly defaultBaseURL?: string
   readonly defaultApiKey?: string
+  /**
+   * Default root directory for built-in filesystem tools when an agent does
+   * not set its own {@link AgentConfig.cwd}. Defaults to
+   * `<process.cwd()>/.agent-workspace`, a sandbox subdirectory auto-created
+   * on first write. Pass `process.cwd()` to widen the sandbox to the entire
+   * working directory, or `null` to disable it globally (filesystem tools
+   * then accept arbitrary absolute or relative paths).
+   */
+  readonly defaultCwd?: string | null
   readonly onProgress?: (event: OrchestratorEvent) => void
   readonly onTrace?: (event: TraceEvent) => void | Promise<void>
   /**
@@ -870,6 +984,12 @@ export interface CoordinatorConfig {
   readonly tools?: readonly string[]
   /** Tool names explicitly denied to the coordinator. */
   readonly disallowedTools?: readonly string[]
+  /**
+   * Root directory used by the coordinator's filesystem tools.
+   * Defaults to {@link OrchestratorConfig.defaultCwd}. Pass `null` to
+   * disable the sandbox for the coordinator only.
+   */
+  readonly cwd?: string | null
   readonly loopDetection?: LoopDetectionConfig
   readonly timeoutMs?: number
 }
@@ -919,9 +1039,9 @@ export interface ToolCallTrace extends TraceEventBase {
   readonly type: 'tool_call'
   readonly tool: string
   readonly isError: boolean
-  /** The input arguments passed to the tool — mirrors the originating ToolUseBlock.input. */
+  /** The input arguments passed to the tool after best-effort sensitive-field redaction. */
   readonly input: Record<string, unknown>
-  /** The serialised output returned by the tool — mirrors ToolResult.data (truncation, if any, has already been applied by the executor). */
+  /** The serialised output returned by the tool after executor truncation and best-effort sensitive-value redaction. */
   readonly output: string
 }
 
@@ -971,6 +1091,24 @@ export type TraceEvent =
 // Memory
 // ---------------------------------------------------------------------------
 
+/** JSON-serializable value accepted by {@link SharedMemory}. */
+export type SharedMemoryValue =
+  | string
+  | number
+  | boolean
+  | null
+  | readonly SharedMemoryValue[]
+  | { readonly [key: string]: SharedMemoryValue }
+
+/** Parsed entry returned by {@link SharedMemory}; the raw {@link MemoryStore} remains string-only. */
+export interface SharedMemoryEntry extends Omit<MemoryEntry, 'value'> {
+  readonly value: SharedMemoryValue
+}
+
+/** Optional write-time validation for shared memory values. */
+export interface SharedMemoryWriteOptions {
+  readonly schema?: ZodSchema<SharedMemoryValue>
+}
 /** A single key-value record stored in a {@link MemoryStore}. */
 export interface MemoryEntry {
   readonly key: string
@@ -1042,6 +1180,10 @@ export interface LLMChatOptions {
   readonly extraBody?: Record<string, unknown>
   /** See {@link AgentConfig.thinking}. */
   readonly thinking?: ThinkingConfig
+  /** See {@link AgentConfig.preserveReasoningAsText}. */
+  readonly preserveReasoningAsText?: boolean
+  /** See {@link AgentConfig.compressReasoningText}. */
+  readonly compressReasoningText?: boolean | { readonly minChars?: number }
   readonly systemPrompt?: string
   readonly abortSignal?: AbortSignal
 }
@@ -1095,11 +1237,19 @@ export interface LLMAdapter {
    *   unsigned thought summaries to keep context lean). Phase 2
    *   implementers MUST consult the adapter-specific outbound serializer
    *   for the full eligibility rule, not just the provenance match.
+   * - `'tool-use-only'`: Native echo is attempted on every assistant
+   *   message inside a tool-calling conversation (one that contains at
+   *   least one `tool_use` block anywhere in its history), gated by
+   *   `block.provenance === this.name`. This includes the final synthesis
+   *   message that has no `tool_use` of its own — omitting it would 400
+   *   the next user turn. Conversations with no `tool_use` anywhere skip
+   *   the echo entirely (per spec, reasoning is ignored there but would
+   *   still bloat context). Used by DeepSeek V4 in thinking mode.
    *
    * Omitted on third-party adapters that pre-date this field; callers treat
    * `undefined` as `'never'` to preserve today's silent-drop behaviour.
    */
   readonly capabilities?: {
-    readonly echoesReasoning: 'never' | 'own-issued'
+    readonly echoesReasoning: 'never' | 'own-issued' | 'tool-use-only'
   }
 }

@@ -221,7 +221,7 @@ describe('OpenAIAdapter', () => {
       ])
     })
 
-    it('passes tool names for fallback text extraction', async () => {
+    it('extracts fallback text tool calls using the requested tool names', async () => {
       // When native tool_calls is empty but text contains tool JSON, the adapter
       // should invoke extractToolCallsFromText with known tool names.
       // We test this indirectly: the completion has text containing tool JSON
@@ -243,9 +243,15 @@ describe('OpenAIAdapter', () => {
         chatOpts({ tools: [toolDef('search')] }),
       )
 
-      // The fromOpenAICompletion + extractToolCallsFromText pipeline should find the tool
-      const toolBlocks = result.content.filter(b => b.type === 'tool_use')
-      expect(toolBlocks.length).toBeGreaterThanOrEqual(0) // may or may not extract depending on format
+      const toolBlocks = result.content.filter((b): b is ToolUseBlock => b.type === 'tool_use')
+      expect(toolBlocks).toHaveLength(1)
+      expect(toolBlocks[0]).toEqual({
+        type: 'tool_use',
+        id: expect.any(String),
+        name: 'search',
+        input: { q: 'test' },
+      })
+      expect(result.stop_reason).toBe('tool_use')
     })
 
     it('propagates SDK errors', async () => {
@@ -369,6 +375,18 @@ describe('OpenAIAdapter', () => {
 
       const toolEvents = events.filter(e => e.type === 'tool_use')
       expect((toolEvents[0].data as ToolUseBlock).input).toEqual({})
+    })
+
+    it('repairs triple-quoted tool arguments through the shared helper', async () => {
+      mockCreate.mockResolvedValue(makeChunks([
+        toolCallChunk(0, 'call_1', 'search', '{"query": """hello"""}', 'tool_calls'),
+        { id: 'chatcmpl-123', model: 'gpt-4o', choices: [], usage: { prompt_tokens: 5, completion_tokens: 3 } },
+      ]))
+
+      const events = await collectEvents(adapter.stream([textMsg('user', 'Hi')], chatOpts()))
+
+      const toolEvents = events.filter(e => e.type === 'tool_use')
+      expect((toolEvents[0].data as ToolUseBlock).input).toEqual({ query: 'hello' })
     })
 
     it('yields error event on stream failure', async () => {

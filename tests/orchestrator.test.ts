@@ -676,6 +676,176 @@ describe('OpenMultiAgent', () => {
       expect(delegatedPrompt).toContain('Inspect delegated detail')
       expect(delegatedPrompt).not.toContain('Coordinator: selected you')
     })
+
+    it('does not run final synthesis when abortSignal is aborted after task execution', async () => {
+      const controller = new AbortController()
+      let coordinatorCalls = 0
+      const coordinatorAdapter: LLMAdapter = {
+        name: 'coordinator-mock',
+        async chat(): Promise<LLMResponse> {
+          coordinatorCalls++
+          return coordinatorCalls === 1
+            ? textResponse('```json\n[{"title": "Work", "description": "Do work", "assignee": "worker"}]\n```')
+            : textResponse('unexpected synthesis')
+        },
+        async *stream() { yield { type: 'done' as const, data: {} } },
+      }
+      const workerAdapter: LLMAdapter = {
+        name: 'worker-mock',
+        async chat(): Promise<LLMResponse> {
+          controller.abort()
+          return textResponse('worker output')
+        },
+        async *stream() { yield { type: 'done' as const, data: {} } },
+      }
+
+      const oma = new OpenMultiAgent({ defaultModel: 'mock-model' })
+      const team = oma.createTeam('t', teamCfg([
+        { ...agentConfig('worker'), adapter: workerAdapter },
+      ]))
+
+      const result = await oma.runTeam(team, 'First do the work, then synthesize the result', {
+        coordinator: { adapter: coordinatorAdapter },
+        abortSignal: controller.signal,
+      })
+
+      expect(coordinatorCalls).toBe(1)
+      expect(result.tasks?.[0]?.status).toBe('completed')
+      expect(result.agentResults.get('worker')?.output).toBe('worker output')
+    })
+
+    it('marks tasks with unknown coordinator dependencies as failed instead of dropping them', async () => {
+      let workerCalls = 0
+      let synthesisPrompt = ''
+      const coordinatorAdapter: LLMAdapter = {
+        name: 'coordinator-mock',
+        async chat(messages: LLMMessage[]): Promise<LLMResponse> {
+          const prompt = extractUserPrompt(messages)
+          if (prompt.includes('Task Results')) {
+            synthesisPrompt = prompt
+            return textResponse('final with gap')
+          }
+          return textResponse('```json\n[{"title": "Use missing", "description": "Use a missing result", "assignee": "worker", "dependsOn": ["Missing research"]}]\n```')
+        },
+        async *stream() { yield { type: 'done' as const, data: {} } },
+      }
+      const workerAdapter: LLMAdapter = {
+        name: 'worker-mock',
+        async chat(): Promise<LLMResponse> {
+          workerCalls++
+          return textResponse('should not run')
+        },
+        async *stream() { yield { type: 'done' as const, data: {} } },
+      }
+
+      const oma = new OpenMultiAgent({ defaultModel: 'mock-model' })
+      const team = oma.createTeam('t', teamCfg([
+        { ...agentConfig('worker'), adapter: workerAdapter },
+      ]))
+
+      const result = await oma.runTeam(team, 'First resolve dependencies, then produce output', {
+        coordinator: { adapter: coordinatorAdapter },
+      })
+
+      const task = result.tasks?.find((t) => t.title === 'Use missing')
+      expect(task?.status).toBe('failed')
+      expect(synthesisPrompt).toContain('Unresolved dependency reference(s): Missing research')
+      expect(workerCalls).toBe(0)
+    })
+
+    it('fails ambiguous title dependencies when coordinator emits duplicate task titles', async () => {
+      let synthesisPrompt = ''
+      const coordinatorAdapter: LLMAdapter = {
+        name: 'coordinator-mock',
+        async chat(messages: LLMMessage[]): Promise<LLMResponse> {
+          const prompt = extractUserPrompt(messages)
+          if (prompt.includes('Task Results')) {
+            synthesisPrompt = prompt
+            return textResponse('final with ambiguity')
+          }
+          return textResponse([
+                '```json',
+                '[',
+                '{"title": "Research", "description": "Research A", "assignee": "worker-a"},',
+                '{"title": "Research", "description": "Research B", "assignee": "worker-b"},',
+                '{"title": "Synthesize", "description": "Use research", "assignee": "worker-a", "dependsOn": ["Research"]}',
+                ']',
+                '```',
+              ].join('\n'))
+        },
+        async *stream() { yield { type: 'done' as const, data: {} } },
+      }
+
+      const oma = new OpenMultiAgent({ defaultModel: 'mock-model' })
+      const team = oma.createTeam('t', teamCfg())
+
+      const result = await oma.runTeam(team, 'First research in parallel, then synthesize', {
+        coordinator: { adapter: coordinatorAdapter },
+      })
+
+      const synth = result.tasks?.find((t) => t.title === 'Synthesize')
+      expect(synth?.status).toBe('failed')
+      expect(synthesisPrompt).toContain('Research (ambiguous duplicate title)')
+    })
+
+    it('includes failed and skipped task sections in final synthesis prompt', async () => {
+      let coordinatorCalls = 0
+      let synthesisPrompt = ''
+      const coordinatorAdapter: LLMAdapter = {
+        name: 'coordinator-mock',
+        async chat(messages: LLMMessage[]): Promise<LLMResponse> {
+          coordinatorCalls++
+          if (coordinatorCalls === 1) {
+            return textResponse([
+              '```json',
+              '[',
+              '{"title": "Failing task", "description": "This fails", "assignee": "worker-a"},',
+              '{"title": "Successful task", "description": "This succeeds", "assignee": "worker-b"},',
+              '{"title": "Later task", "description": "Runs after success", "assignee": "worker-b", "dependsOn": ["Successful task"]}',
+              ']',
+              '```',
+            ].join('\n'))
+          }
+          synthesisPrompt = extractUserPrompt(messages)
+          return textResponse('final with caveats')
+        },
+        async *stream() { yield { type: 'done' as const, data: {} } },
+      }
+      const failingAdapter: LLMAdapter = {
+        name: 'failing-worker',
+        async chat(): Promise<LLMResponse> {
+          throw new Error('worker failed')
+        },
+        async *stream() { yield { type: 'done' as const, data: {} } },
+      }
+      const successAdapter: LLMAdapter = {
+        name: 'success-worker',
+        async chat(): Promise<LLMResponse> {
+          return textResponse('success output')
+        },
+        async *stream() { yield { type: 'done' as const, data: {} } },
+      }
+
+      const oma = new OpenMultiAgent({
+        defaultModel: 'mock-model',
+        onApproval: async () => false,
+      })
+      const team = oma.createTeam('t', teamCfg([
+        { ...agentConfig('worker-a'), adapter: failingAdapter },
+        { ...agentConfig('worker-b'), adapter: successAdapter },
+      ]))
+
+      await oma.runTeam(team, 'First run independent work, then review the remaining step', {
+        coordinator: { adapter: coordinatorAdapter },
+      })
+
+      expect(synthesisPrompt).toContain('## Failed Tasks')
+      expect(synthesisPrompt).toContain('### Failing task (FAILED)')
+      expect(synthesisPrompt).toContain('worker failed')
+      expect(synthesisPrompt).toContain('## Skipped Tasks')
+      expect(synthesisPrompt).toContain('### Later task (SKIPPED)')
+      expect(synthesisPrompt).toContain('Skipped: approval rejected.')
+    })
   })
 
   describe('config defaults', () => {
@@ -965,6 +1135,123 @@ describe('OpenMultiAgent', () => {
       expect(types.filter((t) => t === 'agent_start').length).toBe(
         types.filter((t) => t === 'agent_complete').length,
       )
+    })
+
+    it('creates a serializable artifact from planOnly output and replays without coordinator', async () => {
+      mockAdapterResponses = [
+        '```json\n[' +
+          '{"title": "Research", "description": "Research the topic", "assignee": "worker-a"},' +
+          '{"title": "Write", "description": "Write the guide", "assignee": "worker-b", "dependsOn": ["Research"]}' +
+          ']\n```',
+      ]
+      const oma = new OpenMultiAgent({ defaultModel: 'mock-model' })
+      const team = oma.createTeam('t', teamCfg())
+
+      const planOnlyResult = await oma.runTeam(team, complexGoal, { planOnly: true })
+      const plan = oma.createPlanArtifact(planOnlyResult)
+
+      expect(JSON.parse(JSON.stringify(plan))).toEqual(plan)
+      expect(plan.goal).toBe(complexGoal)
+      expect(plan.tasks).toHaveLength(2)
+      expect(plan.tasks[0]).toMatchObject({ title: 'Research', description: 'Research the topic', assignee: 'worker-a' })
+      expect(plan.tasks[1]?.dependsOn).toEqual([plan.tasks[0]?.id])
+
+      capturedChatOptions = []
+      capturedPrompts = []
+      mockAdapterResponses = ['research done', 'write done', 'coordinator should not be called']
+
+      const replay = await oma.runFromPlan(team, plan)
+
+      expect(replay.success).toBe(true)
+      expect(replay.goal).toBe(complexGoal)
+      expect(capturedChatOptions).toHaveLength(2)
+      expect(replay.agentResults.has('coordinator')).toBe(false)
+      expect(replay.tasks?.map((task) => ({
+        id: task.id,
+        title: task.title,
+        description: task.description,
+        assignee: task.assignee,
+        dependsOn: task.dependsOn,
+      }))).toEqual(plan.tasks.map((task) => ({
+        id: task.id,
+        title: task.title,
+        description: task.description,
+        assignee: task.assignee,
+        dependsOn: task.dependsOn ?? [],
+      })))
+      expect(capturedPrompts[0]).toContain('# Task: Research')
+      expect(capturedPrompts[1]).toContain('# Task: Write')
+      expect(capturedPrompts[1]).toContain('### Research (by worker-a)')
+      expect(capturedPrompts[1]).toContain('research done')
+    })
+
+    it('replays a persisted plan exactly without resolving dependencies by title', async () => {
+      const executionOrder: string[] = []
+      const adapter: LLMAdapter = {
+        name: 'recording',
+        async chat(messages) {
+          const prompt = extractUserPrompt(messages)
+          const title = prompt.includes('# Task: Second') ? 'second' : 'first'
+          executionOrder.push(title)
+          return textResponse(`${title} done`)
+        },
+        async *stream() {
+          yield { type: 'done' as const, data: {} }
+        },
+      }
+      const oma = new OpenMultiAgent({ defaultModel: 'mock-model' })
+      const team = oma.createTeam('t', teamCfg([
+        { ...agentConfig('worker-a'), adapter },
+        { ...agentConfig('worker-b'), adapter },
+      ]))
+      const plan = {
+        version: 1 as const,
+        goal: 'persisted goal',
+        tasks: [
+          { id: 'stable-first-id', title: 'First', description: 'Do first', assignee: 'worker-a' },
+          { id: 'stable-second-id', title: 'Second', description: 'Do second', assignee: 'worker-b', dependsOn: ['stable-first-id'] },
+        ],
+      }
+
+      const replay = await oma.runFromPlan(team, plan)
+
+      expect(replay.success).toBe(true)
+      expect(executionOrder).toEqual(['first', 'second'])
+      expect(replay.tasks?.map((task) => task.id)).toEqual(['stable-first-id', 'stable-second-id'])
+      expect(replay.tasks?.[1]?.dependsOn).toEqual(['stable-first-id'])
+      expect(replay.agentResults.has('coordinator')).toBe(false)
+    })
+
+    it('round-trips memoryScope and retry config through the plan artifact', async () => {
+      mockAdapterResponses = [
+        '```json\n[' +
+          '{"title": "Deep dive", "description": "Investigate", "assignee": "worker-a", "memoryScope": "all", "maxRetries": 2, "retryDelayMs": 500, "retryBackoff": 3}' +
+          ']\n```',
+      ]
+      const oma = new OpenMultiAgent({ defaultModel: 'mock-model' })
+      const team = oma.createTeam('t', teamCfg())
+
+      const planOnlyResult = await oma.runTeam(team, complexGoal, { planOnly: true })
+      const plan = oma.createPlanArtifact(planOnlyResult)
+
+      // Execution config survives serialization into the artifact...
+      expect(plan.tasks[0]).toMatchObject({
+        memoryScope: 'all',
+        maxRetries: 2,
+        retryDelayMs: 500,
+        retryBackoff: 3,
+      })
+      expect(JSON.parse(JSON.stringify(plan))).toEqual(plan)
+
+      // ...and replay applies it, surfacing it back on the task record.
+      mockAdapterResponses = ['done']
+      const replay = await oma.runFromPlan(team, plan)
+      expect(replay.tasks?.[0]).toMatchObject({
+        memoryScope: 'all',
+        maxRetries: 2,
+        retryDelayMs: 500,
+        retryBackoff: 3,
+      })
     })
   })
 

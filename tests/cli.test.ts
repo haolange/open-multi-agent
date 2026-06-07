@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   EXIT,
+  PROVIDER_REFERENCE,
   parseArgs,
   serializeAgentResult,
   serializeTeamRunResult,
@@ -65,5 +66,27 @@ describe('EXIT', () => {
     expect(EXIT.RUN_FAILED).toBe(1)
     expect(EXIT.USAGE).toBe(2)
     expect(EXIT.INTERNAL).toBe(3)
+  })
+})
+
+describe('PROVIDER_REFERENCE', () => {
+  it('includes the Doubao shortcut for provider list/template commands', () => {
+    expect(PROVIDER_REFERENCE).toContainEqual(
+      expect.objectContaining({
+        id: 'doubao',
+        apiKeyEnv: ['ARK_API_KEY'],
+        baseUrlSupported: true,
+      }),
+    )
+  })
+
+  it('includes the MiMo shortcut for provider list/template commands', () => {
+    expect(PROVIDER_REFERENCE).toContainEqual(
+      expect.objectContaining({
+        id: 'mimo',
+        apiKeyEnv: ['MIMO_API_KEY', 'MIMO_BASE_URL'],
+        baseUrlSupported: true,
+      }),
+    )
   })
 })

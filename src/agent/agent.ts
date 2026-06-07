@@ -49,6 +49,7 @@ import type {
 import { emitTrace, generateRunId } from '../utils/trace.js'
 import type { ToolDefinition as FrameworkToolDefinition, ToolRegistry } from '../tool/framework.js'
 import type { ToolExecutor } from '../tool/executor.js'
+import { defaultWorkspaceDir } from '../tool/built-in/path-safety.js'
 import { createAdapter } from '../llm/adapter.js'
 import { AgentRunner, type RunnerOptions, type RunOptions, type RunResult } from './runner.js'
 import {
@@ -172,12 +173,15 @@ export class Agent {
       toolPreset: this.config.toolPreset,
       allowedTools: this.config.tools,
       disallowedTools: this.config.disallowedTools,
+      cwd: this.config.cwd,
       agentName: this.name,
       agentRole: this.config.systemPrompt?.slice(0, 50) ?? 'assistant',
       loopDetection: this.config.loopDetection,
       maxTokenBudget: this.config.maxTokenBudget,
       contextStrategy: this.config.contextStrategy,
       compressToolResults: this.config.compressToolResults,
+      preserveReasoningAsText: this.config.preserveReasoningAsText,
+      compressReasoningText: this.config.compressReasoningText,
     }
 
     this.runner = new AgentRunner(
@@ -664,6 +668,7 @@ export class Agent {
         model: this.config.model,
       },
       abortSignal,
+      cwd: this.config.cwd === undefined ? defaultWorkspaceDir() : this.config.cwd,
     }
   }
 }

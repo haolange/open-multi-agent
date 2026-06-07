@@ -46,6 +46,8 @@ import type {
   AgentRunResult,
   CoordinatorConfig,
   RunTeamOptions,
+  PlanArtifact,
+  PlanTaskArtifact,
   OrchestratorConfig,
   OrchestratorEvent,
   Task,
@@ -64,9 +66,10 @@ import { emitTrace, generateRunId } from '../utils/trace.js'
 import { ToolRegistry } from '../tool/framework.js'
 import { ToolExecutor } from '../tool/executor.js'
 import { registerBuiltInTools } from '../tool/built-in/index.js'
+import { defaultWorkspaceDir } from '../tool/built-in/path-safety.js'
 import { Team } from '../team/team.js'
 import { TaskQueue } from '../task/queue.js'
-import { createTask } from '../task/task.js'
+import { createTask, validateTaskDependencies } from '../task/task.js'
 import { Scheduler } from './scheduler.js'
 import { TokenBudgetExceededError } from '../errors.js'
 import { extractKeywords, keywordScore } from '../utils/keywords.js'
@@ -512,6 +515,7 @@ function buildTaskAgentTeamInfo(
       provider: targetConfig.provider ?? ctx.config.defaultProvider,
       baseURL: targetConfig.baseURL ?? ctx.config.defaultBaseURL,
       apiKey: targetConfig.apiKey ?? ctx.config.defaultApiKey,
+      cwd: targetConfig.cwd === undefined ? ctx.config.defaultCwd : targetConfig.cwd,
     }
     const tempAgent = buildAgent(effective, { includeDelegateTool: true })
 
@@ -922,6 +926,10 @@ export class OpenMultiAgent {
       defaultProvider: config.defaultProvider ?? 'anthropic',
       defaultBaseURL: config.defaultBaseURL,
       defaultApiKey: config.defaultApiKey,
+      // `defaultCwd === undefined` means "use the default sandbox rooted at
+      // <cwd>/.agent-workspace". An explicit `null` propagates through to
+      // disable the filesystem sandbox; a string sets a custom sandbox root.
+      defaultCwd: config.defaultCwd === undefined ? defaultWorkspaceDir() : config.defaultCwd,
       maxTokenBudget: config.maxTokenBudget,
       onApproval: config.onApproval,
       onPlanReady: config.onPlanReady,
@@ -982,6 +990,7 @@ export class OpenMultiAgent {
       provider: config.provider ?? this.config.defaultProvider,
       baseURL: config.baseURL ?? this.config.defaultBaseURL,
       apiKey: config.apiKey ?? this.config.defaultApiKey,
+      cwd: config.cwd === undefined ? this.config.defaultCwd : config.cwd,
       maxTokenBudget: effectiveBudget,
     }
     const agent = buildAgent(effective)
@@ -1088,6 +1097,7 @@ export class OpenMultiAgent {
         provider: bestAgent.provider ?? this.config.defaultProvider,
         baseURL: bestAgent.baseURL ?? this.config.defaultBaseURL,
         apiKey: bestAgent.apiKey ?? this.config.defaultApiKey,
+        cwd: bestAgent.cwd === undefined ? this.config.defaultCwd : bestAgent.cwd,
         maxTokenBudget: effectiveBudget,
       }
       const agent = buildAgent(effective)
@@ -1174,6 +1184,9 @@ export class OpenMultiAgent {
       toolPreset: coordinatorOverrides?.toolPreset,
       tools: coordinatorOverrides?.tools,
       disallowedTools: coordinatorOverrides?.disallowedTools,
+      cwd: coordinatorOverrides?.cwd === undefined
+        ? this.config.defaultCwd
+        : coordinatorOverrides.cwd,
       loopDetection: coordinatorOverrides?.loopDetection,
       timeoutMs: coordinatorOverrides?.timeoutMs,
     }
@@ -1305,6 +1318,11 @@ export class OpenMultiAgent {
         assignee: task.assignee,
         status: task.status,
         dependsOn: task.dependsOn ?? [],
+        description: task.description,
+        memoryScope: task.memoryScope,
+        maxRetries: task.maxRetries,
+        retryDelayMs: task.retryDelayMs,
+        retryBackoff: task.retryBackoff,
         metrics: undefined,
       }))
       this.config.onProgress?.({
@@ -1326,12 +1344,20 @@ export class OpenMultiAgent {
       assignee: task.assignee,
       status: task.status,
       dependsOn: task.dependsOn ?? [],
+      description: task.description,
+      memoryScope: task.memoryScope,
+      maxRetries: task.maxRetries,
+      retryDelayMs: task.retryDelayMs,
+      retryBackoff: task.retryBackoff,
       metrics: taskMetrics.get(task.id),
     }))
 
     // ------------------------------------------------------------------
     // Step 5: Coordinator synthesises final result
     // ------------------------------------------------------------------
+    if (options?.abortSignal?.aborted) {
+      return this.buildTeamRunResult(agentResults, goal, taskRecords)
+    }
     if (
       maxTokenBudget !== undefined
       && cumulativeUsage.input_tokens + cumulativeUsage.output_tokens > maxTokenBudget
@@ -1374,8 +1400,70 @@ export class OpenMultiAgent {
   }
 
   // -------------------------------------------------------------------------
-  // Explicit-task team run
+  // Explicit-task and plan replay team runs
   // -------------------------------------------------------------------------
+
+  /**
+   * Convert a plan-only {@link TeamRunResult} into a serializable plan artifact.
+   *
+   * The input must come from `runTeam(team, goal, { planOnly: true })` on a
+   * version that records task descriptions. Executed run results are rejected
+   * because their task records are not a replay contract.
+   */
+  createPlanArtifact(result: TeamRunResult): PlanArtifact {
+    if (result.planOnly !== true || !result.tasks) {
+      throw new Error('createPlanArtifact requires a plan-only TeamRunResult.')
+    }
+
+    return {
+      version: 1,
+      ...(result.goal !== undefined ? { goal: result.goal } : {}),
+      tasks: result.tasks.map((task): PlanTaskArtifact => {
+        if (!task.description) {
+          throw new Error(`Plan task "${task.id}" is missing a description and cannot be replayed.`)
+        }
+        return {
+          id: task.id,
+          title: task.title,
+          description: task.description,
+          ...(task.assignee !== undefined ? { assignee: task.assignee } : {}),
+          ...(task.dependsOn.length > 0 ? { dependsOn: task.dependsOn } : {}),
+          ...(task.memoryScope !== undefined ? { memoryScope: task.memoryScope } : {}),
+          ...(task.maxRetries !== undefined ? { maxRetries: task.maxRetries } : {}),
+          ...(task.retryDelayMs !== undefined ? { retryDelayMs: task.retryDelayMs } : {}),
+          ...(task.retryBackoff !== undefined ? { retryBackoff: task.retryBackoff } : {}),
+        }
+      }),
+    }
+  }
+
+  /**
+   * Replay a persisted plan artifact without invoking the coordinator.
+   *
+   * Task IDs, dependencies, assignees, titles, and descriptions are used exactly
+   * as stored in the artifact. This is intentionally execution-only; it does not
+   * synthesize a coordinator final answer and it does not implement durable
+   * checkpoints.
+   */
+  async runFromPlan(
+    team: Team,
+    plan: PlanArtifact,
+    options?: { abortSignal?: AbortSignal },
+  ): Promise<TeamRunResult> {
+    if (plan.version !== 1) {
+      throw new Error(`Unsupported plan artifact version: ${String(plan.version)}`)
+    }
+
+    const queue = new TaskQueue()
+    const tasks = this.tasksFromPlan(plan)
+    const validation = validateTaskDependencies(tasks)
+    if (!validation.valid) {
+      throw new Error(`Invalid plan artifact: ${validation.errors.join(' ')}`)
+    }
+    queue.addBatch(tasks)
+
+    return this.executeExplicitTaskQueue(team, queue, options, plan.goal)
+  }
 
   /**
    * Run a team with an explicitly provided task list.
@@ -1403,7 +1491,6 @@ export class OpenMultiAgent {
   ): Promise<TeamRunResult> {
     const agentConfigs = team.getAgents()
     const queue = new TaskQueue()
-    const scheduler = new Scheduler('dependency-first')
 
     this.loadSpecsIntoQueue(
       tasks.map((t) => ({
@@ -1420,37 +1507,7 @@ export class OpenMultiAgent {
       queue,
     )
 
-    scheduler.autoAssign(queue, agentConfigs)
-
-    const pool = this.buildPool(agentConfigs)
-    const agentResults = new Map<string, AgentRunResult>()
-    const ctx: RunContext = {
-      team,
-      pool,
-      scheduler,
-      agentResults,
-      config: this.config,
-      runId: this.config.onTrace ? generateRunId() : undefined,
-      abortSignal: options?.abortSignal,
-      cumulativeUsage: ZERO_USAGE,
-      maxTokenBudget: this.config.maxTokenBudget,
-      budgetExceededTriggered: false,
-      budgetExceededReason: undefined,
-      taskMetrics: new Map<string, TaskExecutionMetrics>(),
-    }
-
-    await executeQueue(queue, ctx)
-
-    const taskRecords: readonly TaskExecutionRecord[] = queue.list().map((task) => ({
-      id: task.id,
-      title: task.title,
-      assignee: task.assignee,
-      status: task.status,
-      dependsOn: task.dependsOn ?? [],
-      metrics: ctx.taskMetrics.get(task.id),
-    }))
-
-    return this.buildTeamRunResult(agentResults, undefined, taskRecords)
+    return this.executeExplicitTaskQueue(team, queue, options)
   }
 
   // -------------------------------------------------------------------------
@@ -1642,6 +1699,71 @@ export class OpenMultiAgent {
     ].join('\n')
   }
 
+  private tasksFromPlan(plan: PlanArtifact): Task[] {
+    const now = new Date()
+    return plan.tasks.map((task): Task => ({
+      id: task.id,
+      title: task.title,
+      description: task.description,
+      status: 'pending' as TaskStatus,
+      ...(task.assignee !== undefined ? { assignee: task.assignee } : {}),
+      ...(task.dependsOn && task.dependsOn.length > 0 ? { dependsOn: [...task.dependsOn] } : {}),
+      ...(task.memoryScope !== undefined ? { memoryScope: task.memoryScope } : {}),
+      result: undefined,
+      createdAt: now,
+      updatedAt: now,
+      ...(task.maxRetries !== undefined ? { maxRetries: task.maxRetries } : {}),
+      ...(task.retryDelayMs !== undefined ? { retryDelayMs: task.retryDelayMs } : {}),
+      ...(task.retryBackoff !== undefined ? { retryBackoff: task.retryBackoff } : {}),
+    }))
+  }
+
+  private async executeExplicitTaskQueue(
+    team: Team,
+    queue: TaskQueue,
+    options?: { abortSignal?: AbortSignal },
+    goal?: string,
+  ): Promise<TeamRunResult> {
+    const agentConfigs = team.getAgents()
+    const scheduler = new Scheduler('dependency-first')
+    scheduler.autoAssign(queue, agentConfigs)
+
+    const pool = this.buildPool(agentConfigs)
+    const agentResults = new Map<string, AgentRunResult>()
+    const ctx: RunContext = {
+      team,
+      pool,
+      scheduler,
+      agentResults,
+      config: this.config,
+      runId: this.config.onTrace ? generateRunId() : undefined,
+      abortSignal: options?.abortSignal,
+      cumulativeUsage: ZERO_USAGE,
+      maxTokenBudget: this.config.maxTokenBudget,
+      budgetExceededTriggered: false,
+      budgetExceededReason: undefined,
+      taskMetrics: new Map<string, TaskExecutionMetrics>(),
+    }
+
+    await executeQueue(queue, ctx)
+
+    const taskRecords: readonly TaskExecutionRecord[] = queue.list().map((task) => ({
+      id: task.id,
+      title: task.title,
+      assignee: task.assignee,
+      status: task.status,
+      dependsOn: task.dependsOn ?? [],
+      description: task.description,
+      memoryScope: task.memoryScope,
+      maxRetries: task.maxRetries,
+      retryDelayMs: task.retryDelayMs,
+      retryBackoff: task.retryBackoff,
+      metrics: ctx.taskMetrics.get(task.id),
+    }))
+
+    return this.buildTeamRunResult(agentResults, goal, taskRecords)
+  }
+
   /**
    * Load a list of task specs into a queue.
    *
@@ -1659,6 +1781,12 @@ export class OpenMultiAgent {
     queue: TaskQueue,
   ): void {
     const agentNames = new Set(agentConfigs.map((a) => a.name))
+    const normalizeTitle = (title: string): string => title.toLowerCase().trim()
+    const titleCounts = new Map<string, number>()
+    for (const spec of specs) {
+      const key = normalizeTitle(spec.title)
+      titleCounts.set(key, (titleCounts.get(key) ?? 0) + 1)
+    }
 
     // First pass: create tasks (without dependencies) to get stable IDs.
     const titleToId = new Map<string, string>()
@@ -1676,7 +1804,10 @@ export class OpenMultiAgent {
         retryDelayMs: spec.retryDelayMs,
         retryBackoff: spec.retryBackoff,
       })
-      titleToId.set(spec.title.toLowerCase().trim(), task.id)
+      const titleKey = normalizeTitle(spec.title)
+      if ((titleCounts.get(titleKey) ?? 0) === 1) {
+        titleToId.set(titleKey, task.id)
+      }
       createdTasks.push(task)
     }
 
@@ -1691,13 +1822,18 @@ export class OpenMultiAgent {
       }
 
       const resolvedDeps: string[] = []
+      const unresolvedDeps: string[] = []
       for (const depRef of spec.dependsOn) {
         // Accept both raw IDs and title strings
         const byId = createdTasks.find((t) => t.id === depRef)
-        const byTitle = titleToId.get(depRef.toLowerCase().trim())
+        const depTitleKey = normalizeTitle(depRef)
+        const byTitle = titleToId.get(depTitleKey)
         const resolvedId = byId?.id ?? byTitle
         if (resolvedId) {
           resolvedDeps.push(resolvedId)
+        } else {
+          const count = titleCounts.get(depTitleKey) ?? 0
+          unresolvedDeps.push(count > 1 ? `${depRef} (ambiguous duplicate title)` : depRef)
         }
       }
 
@@ -1706,6 +1842,12 @@ export class OpenMultiAgent {
         dependsOn: resolvedDeps.length > 0 ? resolvedDeps : undefined,
       }
       queue.add(taskWithDeps)
+      if (unresolvedDeps.length > 0) {
+        queue.fail(
+          task.id,
+          `Unresolved dependency reference(s): ${unresolvedDeps.join(', ')}`,
+        )
+      }
     }
   }
 
@@ -1719,6 +1861,7 @@ export class OpenMultiAgent {
         provider: config.provider ?? this.config.defaultProvider,
         baseURL: config.baseURL ?? this.config.defaultBaseURL,
         apiKey: config.apiKey ?? this.config.defaultApiKey,
+        cwd: config.cwd === undefined ? this.config.defaultCwd : config.cwd,
       }
       pool.add(buildAgent(effective, { includeDelegateTool: true }))
     }

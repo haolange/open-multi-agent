@@ -48,6 +48,8 @@ import { DeepSeekAdapter } from '../src/llm/deepseek.js'
 import { GrokAdapter } from '../src/llm/grok.js'
 import { QiniuAdapter } from '../src/llm/qiniu.js'
 import { MiniMaxAdapter } from '../src/llm/minimax.js'
+import { MiMoAdapter } from '../src/llm/mimo.js'
+import { HunyuanAdapter } from '../src/llm/hunyuan.js'
 import { GeminiAdapter } from '../src/llm/gemini.js'
 import { BedrockAdapter } from '../src/llm/bedrock.js'
 
@@ -58,10 +60,12 @@ describe('LLMAdapter Phase 1 capability contract', () => {
     ['openai', () => new OpenAIAdapter('dummy-key'), 'never' as const],
     ['azure-openai', () => new AzureOpenAIAdapter('dummy-key', 'https://example.openai.azure.com'), 'never' as const],
     ['copilot', () => new CopilotAdapter('dummy-token'), 'never' as const],
-    ['deepseek', () => new DeepSeekAdapter('dummy-key'), 'never' as const],
+    ['deepseek', () => new DeepSeekAdapter('dummy-key'), 'tool-use-only' as const],
     ['grok', () => new GrokAdapter('dummy-key'), 'never' as const],
     ['qiniu', () => new QiniuAdapter('dummy-key'), 'never' as const],
     ['minimax', () => new MiniMaxAdapter('dummy-key'), 'never' as const],
+    ['mimo', () => new MiMoAdapter('dummy-key'), 'tool-use-only' as const],
+    ['hunyuan', () => new HunyuanAdapter('dummy-key'), 'tool-use-only' as const],
     ['bedrock', () => new BedrockAdapter('us-east-1'), 'never' as const],
   ])('%s declares the documented name and capabilities', (expectedName, factory, expectedEcho) => {
     const adapter = factory()
@@ -70,14 +74,40 @@ describe('LLMAdapter Phase 1 capability contract', () => {
     expect(adapter.capabilities?.echoesReasoning).toBe(expectedEcho)
   })
 
-  it('OpenAI subclasses inherit `capabilities` from OpenAIAdapter', () => {
-    // Sanity check: the subclasses don't redeclare `capabilities` and rely on
-    // inheritance so any future adjustment to the parent's value propagates.
+  it('OpenAI subclasses inherit `capabilities` from OpenAIAdapter (except DeepSeek)', () => {
+    // Sanity check: most subclasses don't redeclare `capabilities` and rely
+    // on inheritance so any future adjustment to the parent's value
+    // propagates. DeepSeek is the deliberate exception — see the next test.
     const parent = new OpenAIAdapter('dummy-key').capabilities
-    expect(new DeepSeekAdapter('dummy-key').capabilities).toEqual(parent)
     expect(new GrokAdapter('dummy-key').capabilities).toEqual(parent)
     expect(new QiniuAdapter('dummy-key').capabilities).toEqual(parent)
     expect(new MiniMaxAdapter('dummy-key').capabilities).toEqual(parent)
+  })
+
+  it('DeepSeek, MiMo and Hunyuan override `capabilities` to `tool-use-only`', () => {
+    // DeepSeek and MiMo thinking modes require `reasoning_content` to be
+    // echoed back on follow-up requests with prior tool-use turns; without
+    // this override they would inherit OpenAI's `'never'` and hit 400 on the
+    // second turn of a tool-using agent. Hunyuan's hy3-preview interleaved
+    // thinking has the same backfill requirement (quality, not a hard 400).
+    expect(new DeepSeekAdapter('dummy-key').capabilities).toEqual({
+      echoesReasoning: 'tool-use-only',
+    })
+    expect(new MiMoAdapter('dummy-key').capabilities).toEqual({
+      echoesReasoning: 'tool-use-only',
+    })
+    expect(new HunyuanAdapter('dummy-key').capabilities).toEqual({
+      echoesReasoning: 'tool-use-only',
+    })
+    expect(new DeepSeekAdapter('dummy-key').capabilities).not.toEqual(
+      new OpenAIAdapter('dummy-key').capabilities,
+    )
+    expect(new MiMoAdapter('dummy-key').capabilities).not.toEqual(
+      new OpenAIAdapter('dummy-key').capabilities,
+    )
+    expect(new HunyuanAdapter('dummy-key').capabilities).not.toEqual(
+      new OpenAIAdapter('dummy-key').capabilities,
+    )
   })
 })
 

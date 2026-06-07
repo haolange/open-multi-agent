@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 /**
- * Thin shell/CI wrapper over OpenMultiAgent — no interactive session, cwd binding,
- * approvals, or persistence.
+ * Thin shell/CI wrapper over OpenMultiAgent — no interactive session, approvals,
+ * or persistence. The filesystem-tool sandbox root is configurable through the
+ * orchestrator/agent JSON (`defaultCwd` / `cwd`).
  *
  * Exit codes:
  *   0 — finished; team run succeeded
@@ -42,7 +43,7 @@ class OmaValidationError extends Error {
 // Provider helper (static reference data)
 // ---------------------------------------------------------------------------
 
-const PROVIDER_REFERENCE: ReadonlyArray<{
+export const PROVIDER_REFERENCE: ReadonlyArray<{
   id: SupportedProvider
   apiKeyEnv: readonly string[]
   baseUrlSupported: boolean
@@ -54,7 +55,10 @@ const PROVIDER_REFERENCE: ReadonlyArray<{
   { id: 'gemini', apiKeyEnv: ['GEMINI_API_KEY', 'GOOGLE_API_KEY'], baseUrlSupported: false },
   { id: 'grok', apiKeyEnv: ['XAI_API_KEY'], baseUrlSupported: true },
   { id: 'minimax', apiKeyEnv: ['MINIMAX_API_KEY'], baseUrlSupported: true, notes: 'Global endpoint: https://api.minimax.io/v1 (default). China endpoint: https://api.minimaxi.com/v1. Set MINIMAX_BASE_URL to choose, or pass baseURL in agent config.' },
-  { id: 'deepseek', apiKeyEnv: ['DEEPSEEK_API_KEY'], baseUrlSupported: true, notes: 'OpenAI-compatible endpoint at https://api.deepseek.com/v1. Models: deepseek-chat (V3), deepseek-reasoner (thinking).' },
+  { id: 'mimo', apiKeyEnv: ['MIMO_API_KEY', 'MIMO_BASE_URL'], baseUrlSupported: true, notes: 'OpenAI-compatible endpoint at https://api.xiaomimimo.com/v1 by default. Token Plan keys (tp-...) require the cluster base URL from your subscription page; set MIMO_BASE_URL or pass baseURL in agent config.' },
+  { id: 'deepseek', apiKeyEnv: ['DEEPSEEK_API_KEY'], baseUrlSupported: true, notes: 'OpenAI-compatible endpoint at https://api.deepseek.com/v1. Models: deepseek-v4-flash (default), deepseek-v4-pro (flagship); both support 1M context. Legacy deepseek-chat/deepseek-reasoner retire 2026-07-24.' },
+  { id: 'doubao', apiKeyEnv: ['ARK_API_KEY'], baseUrlSupported: true, notes: 'OpenAI-compatible Volcengine Ark endpoint at https://ark.cn-beijing.volces.com/api/v3. Set provider to doubao and choose a model available to your Ark key.' },
+  { id: 'hunyuan', apiKeyEnv: ['HUNYUAN_API_KEY', 'HUNYUAN_BASE_URL'], baseUrlSupported: true, notes: 'OpenAI-compatible. Defaults to the current Tencent MaaS / TokenHub endpoint https://tokenhub.tencentmaas.com/v1 (sk-... keys, models like hy3-preview). The legacy Tencent Cloud endpoint https://api.hunyuan.cloud.tencent.com/v1 (models like hunyuan-turbos-latest) is being retired by Tencent (shutdown 2026-09-30); target it via HUNYUAN_BASE_URL until then. Tool calling verified on hy3-preview / hunyuan-turbos / hunyuan-functioncall.' },
   { id: 'qiniu', apiKeyEnv: ['QINIU_API_KEY'], baseUrlSupported: true, notes: 'OpenAI-compatible endpoint at https://api.qnaigc.com/v1. Set provider to qiniu and choose a model available to your key.' },
   {
     id: 'copilot',
@@ -287,7 +291,10 @@ const DEFAULT_MODEL_HINT: Record<SupportedProvider, string> = {
   grok: 'grok-2-latest',
   copilot: 'gpt-4o',
   minimax: 'MiniMax-M2.7',
-  deepseek: 'deepseek-chat',
+  mimo: 'mimo-v2.5-pro',
+  deepseek: 'deepseek-v4-flash',
+  doubao: 'doubao-seed-1-8-251228',
+  hunyuan: 'hy3-preview',
   qiniu: 'deepseek-v3',
   bedrock: 'anthropic.claude-3-5-haiku-20241022-v1:0',
 }

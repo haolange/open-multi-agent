@@ -20,7 +20,7 @@ npm run build
 node dist/cli/oma.js help
 ```
 
-Set the usual provider API keys in the environment (see [README](../README.md#quick-start)); the CLI does not read secrets from flags. MiniMax additionally reads `MINIMAX_BASE_URL` to select the global (`https://api.minimax.io/v1`) or China (`https://api.minimaxi.com/v1`) endpoint.
+Set the usual provider API keys in the environment (see [README](../README.md#quick-start)); the CLI does not read secrets from flags. MiniMax additionally reads `MINIMAX_BASE_URL` to select the global (`https://api.minimax.io/v1`) or China (`https://api.minimaxi.com/v1`) endpoint. MiMo additionally reads `MIMO_BASE_URL` for Token Plan cluster endpoints such as `https://token-plan-cn.xiaomimimo.com/v1`.
 
 OpenRouter works through the OpenAI-compatible adapter: set `provider` to `openai`, `baseURL` to `https://openrouter.ai/api/v1`, and pass `OPENROUTER_API_KEY` as the agent or orchestrator `apiKey`.
 
@@ -34,7 +34,7 @@ Runs **`OpenMultiAgent.runTeam(team, goal)`**: coordinator decomposition, task q
 
 When invoked with `--dashboard`, the **`oma` CLI** writes a static post-execution DAG dashboard HTML to `oma-dashboards/runTeam-<timestamp>.html` under the current working directory (the library does not write files itself; if you want this outside the CLI, call `renderTeamRunDashboard(result)` in application code — see `src/dashboard/render-team-run-dashboard.ts`).
 
-The dashboard page loads **Tailwind CSS** (Play CDN), **Google Fonts** (Space Grotesk, Inter, Material Symbols), and **Material Symbols** from the network at view time. Opening the HTML file requires an **online** environment unless you host or inline those assets yourself (a future improvement).
+The dashboard page is self-contained: it does not load remote scripts, stylesheets, or fonts, and sensitive-looking values in the embedded run payload are redacted before rendering.
 
 | Argument | Required | Description |
 |----------|----------|-------------|
@@ -62,7 +62,7 @@ Global flags: [`--pretty`](#output-flags), [`--include-messages`](#output-flags)
 Read-only helper for wiring JSON configs and env vars.
 
 - **`oma provider`** or **`oma provider list`** — Prints JSON: built-in provider ids, API key environment variable names, whether `baseURL` is supported, and short notes (e.g. OpenAI-compatible servers, Copilot in CI).
-- **`oma provider template <provider>`** — Prints a JSON object with example `orchestrator` and `agent` fields plus placeholder `env` entries. `<provider>` is one of: `anthropic`, `openai`, `gemini`, `grok`, `minimax`, `deepseek`, `qiniu`, `copilot`.
+- **`oma provider template <provider>`** — Prints a JSON object with example `orchestrator` and `agent` fields plus placeholder `env` entries. `<provider>` is one of: `anthropic`, `azure-openai`, `openai`, `gemini`, `grok`, `minimax`, `mimo`, `deepseek`, `doubao`, `qiniu`, `copilot`, `bedrock`.
 
 For OpenRouter, use the `openai` provider template, set `baseURL` to `https://openrouter.ai/api/v1`, and set `apiKey` from `OPENROUTER_API_KEY` in your JSON config.
 
@@ -170,6 +170,8 @@ If **`--team path.json`** is passed, the file’s top-level `team` property is i
 
 These files are arbitrary JSON objects merged into **`OrchestratorConfig`** and **`CoordinatorConfig`**. Function-valued options (`onProgress`, `onApproval`, etc.) cannot appear in JSON and are not supported by the CLI.
 
+Set `defaultCwd` on the orchestrator JSON, or `cwd` on individual agents/coordinator JSON, to choose the sandbox root for built-in filesystem tools. Paths passed to `file_read`, `file_write`, `file_edit`, `grep`, and `glob` must be absolute and resolve inside that root. When `defaultCwd` is omitted, the sandbox defaults to `<cwd>/.agent-workspace` (auto-created on first write). Pass the string `"<process.cwd()>"`-equivalent absolute path to widen it to the full working directory, or `null` to disable the sandbox. The `bash` tool is intentionally not covered — see `docs/tool-configuration.md` for the rationale and recommended posture.
+
 ---
 
 ## Output
@@ -184,6 +186,16 @@ Every invocation prints **one JSON document** to stdout, followed by a newline.
 {
   "command": "run",
   "success": true,
+  "goal": "Build a REST API with token auth",
+  "tasks": [
+    {
+      "id": "task-1",
+      "title": "Design the database schema",
+      "assignee": "architect",
+      "status": "completed",
+      "dependsOn": []
+    }
+  ],
   "totalTokenUsage": { "input_tokens": 0, "output_tokens": 0 },
   "agentResults": {
     "architect": {
@@ -260,6 +272,6 @@ esac
 ## Limitations (by design)
 
 - No TTY session, history, or `stdin` goal input.
-- No built-in **`cwd`** or metadata passed into `ToolUseContext` (tools use process cwd unless the library adds other hooks later).
+- No dedicated flag for the filesystem sandbox root; configure it through `defaultCwd` / `cwd` in the orchestrator or agent JSON.
 - No **`onApproval`** from JSON; non-interactive batch only.
 - Coordinator **`runTeam`** path still requires network and API keys like any other run.
