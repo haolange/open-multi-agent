@@ -1,6 +1,8 @@
 # CLAUDE.md
 
-This file is the working map for editing this repository: the conventions, the layer layout, the non-obvious invariants, and pointers into `docs/`. It stays lean because it loads into every Claude Code session. Conceptual architecture, the provider table, and the production checklist live in [README.md](README.md); detailed subsystem behavior lives in [`docs/`](docs/) and is linked inline below rather than duplicated here.
+This file is the working map for editing this repository: the conventions, the layer layout, the non-obvious invariants, and pointers into `docs/`. It stays lean because it loads into every Claude Code session. Conceptual architecture, the provider table, and the production checklist live in the package page [packages/core/README.md](packages/core/README.md); detailed subsystem behavior lives in [`docs/`](docs/) and is linked inline below rather than duplicated here.
+
+**Monorepo layout.** The published package `@open-multi-agent/core` lives in [`packages/core/`](packages/core/) — its source, tests, examples, and the npm package README. The repo root is a private npm-workspaces manager (`package.json` `"private": true`) that delegates `build` / `lint` / `test` / `dev` to the package, so the commands below run from the root. Unprefixed code paths in this doc (`src/…`, `tests/…`, `cli/oma.ts`, the layer map below) are relative to `packages/core/`; `docs/` and the GitHub-facade `README.md` live at the repo root.
 
 ## Commands
 
@@ -12,7 +14,7 @@ npm test               # Run all tests (vitest run)
 npm run test:watch     # Vitest watch mode
 npm run test:coverage  # Vitest with v8 coverage
 npm run test:e2e       # E2E suite (requires RUN_E2E=1, real API keys)
-node dist/cli/oma.js help   # After build: shell/CI CLI (`oma` when installed via npm bin)
+node packages/core/dist/cli/oma.js help   # After build: shell/CI CLI (`oma` when installed via npm bin)
 ```
 
 Tests live in `tests/` (vitest), E2E under `tests/e2e/`. Standalone `examples/` need real API keys and are grouped by intent (`basics/`, `cookbook/`, `patterns/`, `providers/`, `integrations/`, `production/`).
@@ -60,7 +62,8 @@ The framework's key feature. The coordinator receives goal + roster → emits a 
 Behavior that isn't visible from any single file and will cause bugs if missed:
 
 - **Tool errors never throw** — they're caught and returned as `ToolResult(isError: true)`. Task failures cascade to dependents (independent tasks continue); LLM API errors propagate to the caller.
-- **`delegate_to_agent` is opt-in and orchestration-only** — injected only inside `runTeam`/`runTasks` pool workers, never in standalone `runAgent` or the `isSimpleGoal` short-circuit. Self-delegation, cycles, unknown targets, depth > `maxDelegationDepth` (default 3), and pool-slot exhaustion are all rejected in the tool; delegated token usage counts against the parent budget. → [docs/tool-configuration.md](docs/tool-configuration.md)
+- **Built-in tools are default-deny** — `resolveTools()` (`agent/runner.ts`) grants a built-in (`bash`, `file_*`, `grep`, `glob`, `delegate_to_agent`) only when `AgentConfig.tools` or `toolPreset` is set; with neither, an agent resolves to **zero** built-in tools. Custom/runtime tools (`customTools` / `addTool`) are exempt — registration is the grant — but still honor `disallowedTools`. The runner gates execution on the same granted set, so a registered-but-ungranted call returns a `"not granted"` error instead of running. `OrchestratorConfig.defaultToolPreset` restores the prior allow-all. Uniform across `runAgent` / `runTeam` / `runTasks` / short-circuit / standalone `Agent`. → [docs/tool-configuration.md](docs/tool-configuration.md)
+- **`delegate_to_agent` is orchestration-only and needs a grant** — registered only inside `runTeam`/`runTasks` pool workers (never in standalone `runAgent` or the `isSimpleGoal` short-circuit), and like every built-in it must be granted via `tools: ['delegate_to_agent']` to be callable. Self-delegation, cycles, unknown targets, depth > `maxDelegationDepth` (default 3), and pool-slot exhaustion are all rejected in the tool; delegated token usage counts against the parent budget. → [docs/tool-configuration.md](docs/tool-configuration.md)
 - **Filesystem tools are sandboxed, `bash` is not** — `file_read/file_write/file_edit/grep/glob` resolve every path (symlinks included) within `AgentConfig.cwd` / `OrchestratorConfig.defaultCwd`, defaulting to `<cwd>/.agent-workspace`. `null` disables the sandbox; `process.cwd()` widens it. → [docs/tool-configuration.md](docs/tool-configuration.md)
 - **Reasoning is dropped unless opted in** — provider-native `ReasoningBlock`s the target adapter can't echo are silently dropped unless `AgentConfig.preserveReasoningAsText` is on (then converted to inline `<thinking>` text). `<thinking>` text is never parsed back into a signed block. → [docs/context-management.md](docs/context-management.md)
 - **Local-model tool-call fallback** — `text-tool-extractor.ts` only runs when the server emits no native `tool_calls` (Ollama/vLLM/LM Studio); native calls always win.
@@ -76,6 +79,7 @@ Detailed behavior is documented in `docs/` — the single source of truth, so up
 | Tool presets, custom tools, sandbox, delegation, MCP | `tool/` | [tool-configuration.md](docs/tool-configuration.md) |
 | Providers, env vars, local servers, AI SDK bridge | `llm/` | [providers.md](docs/providers.md) |
 | Shared memory + custom backends | `memory/` | [shared-memory.md](docs/shared-memory.md) |
+| Checkpoint/resume over `MemoryStore` | `memory/checkpoint.ts`, `orchestrator/orchestrator.ts` | [checkpoint.md](docs/checkpoint.md) |
 | Tracing, progress events, dashboard | `utils/trace.ts`, `dashboard/` | [observability.md](docs/observability.md) |
 | CLI usage + JSON schemas | `cli/oma.ts` | [cli.md](docs/cli.md) |
 

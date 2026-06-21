@@ -6,9 +6,29 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       matrix:
         node-version: [18, 20, 22]
@@ -19,11 +39,11 @@ jobs:
           node-version: ${{ matrix.node-version }}
           cache: npm
       - run: npm ci
-      - run: npm run lint
       - run: npm test
 
   coverage:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -35,11 +55,12 @@ jobs:
       - uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          files: ./coverage/lcov.info
+          files: ./packages/core/coverage/lcov.info
           fail_ci_if_error: false
 
   package:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -48,7 +69,25 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
+      - name: Smoke-test that the built entry points import and the CLI runs
+        working-directory: packages/core
+        run: |
+          node -e "Promise.all([import('./dist/index.js'), import('./dist/mcp.js'), import('./dist/ai-sdk.js')]).then(() => console.log('entry points import OK')).catch((e) => { console.error(e); process.exit(1); })"
+          node dist/cli/oma.js help > /dev/null
+          echo "CLI help runs OK"
+      - name: Assert the create-oma-app template pins the current core version
+        run: |
+          core_version=$(jq -r .version packages/core/package.json)
+          pinned=$(jq -r '.dependencies["@open-multi-agent/core"]' packages/create-oma-app/template/package.json)
+          if [ "$pinned" != "$core_version" ]; then
+            echo "create-oma-app template pins @open-multi-agent/core@$pinned but this repo's core is $core_version."
+            echo "Bump the pin in packages/create-oma-app/template/package.json to match before release."
+            exit 1
+          fi
+      - name: Typecheck the create-oma-app template against core
+        run: npm run typecheck:template -w create-oma-app
       - name: Assert the npm tarball ships exactly the expected files
+        working-directory: packages/core
         run: |
           paths=$(npm pack --dry-run --json | jq -r '.[0].files[].path')
           unexpected=$(echo "$paths" | grep -vE '^(dist/|README\.md$|LICENSE$|package\.json$)' || true)
@@ -67,3 +106,37 @@ jobs:
             echo "Either the build did not run or an entry was dropped from package.json \"files\"."
             exit 1
           fi
+
+      - name: Assert the create-oma-app tarball ships dist + template
+        working-directory: packages/create-oma-app
+        run: |
+          paths=$(npm pack --dry-run --json | jq -r '.[0].files[].path')
+          unexpected=$(echo "$paths" | grep -vE '^(dist/|template/|README\.md$|LICENSE$|package\.json$)' || true)
+          if [ -n "$unexpected" ]; then
+            echo "Unexpected files staged for the create-oma-app tarball:"
+            echo "$unexpected"
+            echo "Only dist/, template/, README.md, LICENSE, package.json may ship."
+            exit 1
+          fi
+          missing=""
+          for f in dist/index.js dist/scaffold.js template/package.json template/src/index.ts template/_env.example template/_gitignore; do
+            echo "$paths" | grep -qxF "$f" || missing="$missing $f"
+          done
+          if [ -n "$missing" ]; then
+            echo "Required files missing from the create-oma-app tarball:$missing"
+            echo "The scaffolder needs its template/ to function once published."
+            exit 1
+          fi
+
+  scaffold-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: End-to-end scaffold smoke test (pack -> generate -> install -> run gate)
+        run: npm run test:scaffold
