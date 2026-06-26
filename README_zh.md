@@ -43,7 +43,7 @@
 
 > **工程师只描述目标，不画任务图。**
 
-图优先的框架要求预先列出每个节点与每条边；任务 DAG 则在运行时生成，随目标自适应，而非针对单一流程预先固化。
+图优先的框架要求预先列出每个节点与每条边；OMA 是**动态工作流**（dynamic workflow）：任务 DAG 在运行时生成，随目标自适应，而非针对单一流程预先固化。协调者将该计划以数据形式交给确定性调度器执行，因此该计划可审查、可回放。
 
 `@open-multi-agent/core` 坚持轻量内核：编排引擎加上主流模型 provider（Anthropic、OpenAI 及任意 OpenAI 兼容端点）开箱即用；额外的 provider（Gemini、Bedrock）、MCP、Vercel AI SDK bridge 均为可选 peer 依赖，按需安装。
 
@@ -86,6 +86,7 @@ npm install @open-multi-agent/core
 **基于 OMA 构建**
 
 - **[temodar-agent](https://github.com/xeloxa/temodar-agent)**（约 60 stars）。WordPress 安全分析平台，作者 [Ali Sünbül](https://github.com/xeloxa)。在 Docker runtime 里直接用我们的内置工具（`bash`、`file_*`、`grep`）。已确认生产环境使用。
+- **[Mark Galyan](https://github.com/apollo-mg)** 在本地量化模型上完全离线运行 OMA，借助 coordinator 与上下文压缩，在显存受限的条件下维持自治 agent 循环持续运行。自框架发布首月起持续贡献，涵盖上下文压缩、采样与工具调用解析。
 - **[PR-Copilot](https://github.com/kidoom/PR-Copilot)**。AI pull request 审查助手，作者 [kidoom](https://github.com/kidoom)。运行一个 OMA 审查 team（coordinator + 限定范围的 reviewer agent），用 `defineTool` 定义仓库上下文工具，并加入自定义 `ContextStrategy` 做 token-aware 的 PR diff 压缩。公开代码，基于 `@open-multi-agent/core`。
 - **[StuFlow](https://github.com/znc15/StuFlow)**。终端 AI 编码助手，作者 [znc15](https://github.com/znc15)。以 OMA 为编排内核：构建 team 并通过 `runAgent` / `runTasks` / `runTeam` 驱动，配自定义 `RunTeamOptions` coordinator，搭配 DeepSeek。公开代码，基于 `@open-multi-agent/core`。
 
