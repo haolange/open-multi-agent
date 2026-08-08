@@ -21,7 +21,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
       - run: npm ci
       - run: npm run lint
@@ -31,7 +31,7 @@ jobs:
     timeout-minutes: 15
     strategy:
       matrix:
-        node-version: [18, 20, 22]
+        node-version: [20, 22, 24]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -44,19 +44,22 @@ jobs:
   coverage:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
       - run: npm ci
       - run: npm run test:coverage
       - uses: codecov/codecov-action@v5
         with:
-          token: ${{ secrets.CODECOV_TOKEN }}
+          use_oidc: true
           files: ./packages/core/coverage/lcov.info
-          fail_ci_if_error: false
+          fail_ci_if_error: true
 
   package:
     runs-on: ubuntu-latest
@@ -65,25 +68,50 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
       - run: npm ci
       - run: npm run build
       - name: Smoke-test that the built entry points import and the CLI runs
         working-directory: packages/core
         run: |
-          node -e "Promise.all([import('./dist/index.js'), import('./dist/mcp.js'), import('./dist/ai-sdk.js')]).then(() => console.log('entry points import OK')).catch((e) => { console.error(e); process.exit(1); })"
-          node dist/cli/oma.js help > /dev/null
+          node -e "Promise.all([import('./dist/index.js'), import('./dist/observability/index.js'), import('./dist/observability/file.js'), import('./dist/acp.js'), import('./dist/process.js'), import('./dist/mcp.js'), import('./dist/ai-sdk.js'), import('./dist/eval/index.js'), import('./dist/eval/file.js')]).then(() => console.log('entry points import OK')).catch((e) => { console.error(e); process.exit(1); })"
+          node dist/cli/oma.js help | grep -q "oma eval run"
+          node dist/cli/oma.js help | grep -q "oma eval gate"
           echo "CLI help runs OK"
+      - name: Run the no-network evaluation gate pass and fail paths
+        working-directory: packages/core
+        run: |
+          eval_gate_out=$(mktemp -d)
+          node dist/cli/oma.js eval run \
+            --set tests/fixtures/eval/set.json \
+            --target tests/fixtures/eval/target.mjs \
+            --gate tests/fixtures/eval/gate.json \
+            --baseline tests/fixtures/eval/baseline.json \
+            --out "$eval_gate_out/pass" > "$eval_gate_out/pass-summary.json"
+          jq -e '.verdict.pass == true' "$eval_gate_out/pass-summary.json"
+
+          set +e
+          node dist/cli/oma.js eval run \
+            --set tests/fixtures/eval/set.json \
+            --target tests/fixtures/eval/target-gate-fail.mjs \
+            --gate tests/fixtures/eval/gate.json \
+            --baseline tests/fixtures/eval/baseline.json \
+            --out "$eval_gate_out/fail" > "$eval_gate_out/fail-summary.json"
+          eval_gate_status=$?
+          set -e
+          test "$eval_gate_status" -eq 1
+          jq -e '.verdict.pass == false' "$eval_gate_out/fail-summary.json"
       - name: Assert the create-oma-app template pins the current core version
         run: |
           core_version=$(jq -r .version packages/core/package.json)
-          pinned=$(jq -r '.dependencies["@open-multi-agent/core"]' packages/create-oma-app/template/package.json)
-          if [ "$pinned" != "$core_version" ]; then
-            echo "create-oma-app template pins @open-multi-agent/core@$pinned but this repo's core is $core_version."
-            echo "Bump the pin in packages/create-oma-app/template/package.json to match before release."
-            exit 1
-          fi
+          for manifest in packages/create-oma-app/templates/*/package.json; do
+            pinned=$(jq -r '.dependencies["@open-multi-agent/core"]' "$manifest")
+            if [ "$pinned" != "$core_version" ]; then
+              echo "$manifest pins @open-multi-agent/core@$pinned but this repo's core is $core_version."
+              exit 1
+            fi
+          done
       - name: Typecheck the create-oma-app template against core
         run: npm run typecheck:template -w create-oma-app
       - name: Assert the npm tarball ships exactly the expected files
@@ -98,7 +126,7 @@ jobs:
             exit 1
           fi
           missing=""
-          for f in dist/index.js dist/index.d.ts dist/cli/oma.js dist/mcp.js dist/mcp.d.ts dist/ai-sdk.js dist/ai-sdk.d.ts; do
+          for f in dist/index.js dist/index.d.ts dist/observability/index.js dist/observability/index.d.ts dist/observability/file.js dist/observability/file.d.ts dist/cli/oma.js dist/acp.js dist/acp.d.ts dist/process.js dist/process.d.ts dist/mcp.js dist/mcp.d.ts dist/ai-sdk.js dist/ai-sdk.d.ts dist/eval/index.js dist/eval/index.d.ts dist/eval/file.js dist/eval/file.d.ts; do
             echo "$paths" | grep -qxF "$f" || missing="$missing $f"
           done
           if [ -n "$missing" ]; then
@@ -107,11 +135,24 @@ jobs:
             exit 1
           fi
 
+      - name: Smoke-test the installed core npm bin
+        working-directory: packages/core
+        run: |
+          pack_dir=$(mktemp -d)
+          consumer_dir=$(mktemp -d)
+          pack_json=$(npm pack --json --pack-destination "$pack_dir")
+          tarball=$(echo "$pack_json" | jq -r '.[0].filename')
+          npm install --prefix "$consumer_dir" "$pack_dir/$tarball"
+          help_output=$("$consumer_dir/node_modules/.bin/oma" help)
+          echo "$help_output" | grep -q "oma eval run"
+          echo "$help_output" | grep -q "oma eval gate"
+          echo "Installed CLI help runs OK"
+
       - name: Assert the create-oma-app tarball ships dist + template
         working-directory: packages/create-oma-app
         run: |
           paths=$(npm pack --dry-run --json | jq -r '.[0].files[].path')
-          unexpected=$(echo "$paths" | grep -vE '^(dist/|template/|README\.md$|LICENSE$|package\.json$)' || true)
+          unexpected=$(echo "$paths" | grep -vE '^(dist/|template/|templates/|README\.md$|LICENSE$|package\.json$)' || true)
           if [ -n "$unexpected" ]; then
             echo "Unexpected files staged for the create-oma-app tarball:"
             echo "$unexpected"
@@ -119,7 +160,7 @@ jobs:
             exit 1
           fi
           missing=""
-          for f in dist/index.js dist/scaffold.js template/package.json template/src/index.ts template/_env.example template/_gitignore; do
+          for f in dist/index.js dist/scaffold.js templates/demo/package.json templates/pr-review/src/index.ts templates/security/src/index.ts template/src/runtime.ts template/src/report.ts template/_env.example template/_env.ollama template/_gitignore; do
             echo "$paths" | grep -qxF "$f" || missing="$missing $f"
           done
           if [ -n "$missing" ]; then
@@ -128,6 +169,60 @@ jobs:
             exit 1
           fi
 
+      - name: Smoke-test that the otel entry point imports
+        working-directory: packages/otel
+        run: node -e "import('./dist/index.js').then(() => console.log('otel entry point imports OK')).catch((e) => { console.error(e); process.exit(1); })"
+
+      - name: Assert the otel tarball ships exactly the expected files
+        working-directory: packages/otel
+        run: |
+          paths=$(npm pack --dry-run --json | jq -r '.[0].files[].path')
+          unexpected=$(echo "$paths" | grep -vE '^(dist/|README\.md$|LICENSE$|package\.json$)' || true)
+          if [ -n "$unexpected" ]; then
+            echo "Unexpected files staged for the @open-multi-agent/otel tarball:"
+            echo "$unexpected"
+            echo "Only dist/, README.md, LICENSE, package.json may ship."
+            exit 1
+          fi
+          missing=""
+          for f in dist/index.js dist/index.d.ts; do
+            echo "$paths" | grep -qxF "$f" || missing="$missing $f"
+          done
+          if [ -n "$missing" ]; then
+            echo "Required entry points missing from the @open-multi-agent/otel tarball:$missing"
+            echo "Either the build did not run or an entry was dropped from package.json \"files\"."
+            exit 1
+          fi
+
+      - name: Run public observability examples without network or API keys
+        run: npm run test:observability-examples
+
+      - name: Run public evaluation example without network or API keys
+        run: npm run test:eval-examples
+
+      - name: Run tolerant same-host observability regression gate
+        run: npm run bench:observability:ci
+
+      - name: Pack the minimum core version supported by OTel
+        id: minimum-otel-core
+        run: |
+          set -euo pipefail
+          range=$(jq -r '.dependencies["@open-multi-agent/core"]' packages/otel/package.json)
+          if [[ ! "$range" =~ ^\^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::expected an exact caret range for the OTel core dependency; got $range"
+            exit 1
+          fi
+          minimum="${range#^}"
+          filename=$(npm pack "@open-multi-agent/core@$minimum" --pack-destination "$RUNNER_TEMP" --json | jq -er '.[0].filename')
+          tarball="$RUNNER_TEMP/$filename"
+          test -f "$tarball"
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+
+      - name: Install real core and OTel tarballs in clean consumers
+        env:
+          OMA_OBSERVABILITY_MIN_CORE_TARBALL: ${{ steps.minimum-otel-core.outputs.tarball }}
+        run: npm run test:observability-pack
+
   scaffold-e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -135,7 +230,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
       - run: npm ci
       - name: End-to-end scaffold smoke test (pack -> generate -> install -> run gate)

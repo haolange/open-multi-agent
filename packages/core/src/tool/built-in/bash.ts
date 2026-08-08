@@ -5,10 +5,11 @@
  * optional timeout and a custom working directory.
  */
 
-import { spawn, type ChildProcess } from 'child_process'
+import { spawn } from 'child_process'
 import { z } from 'zod'
 import { defineTool } from '../framework.js'
 import { isSensitiveName, redactSensitiveText } from '../../utils/redaction.js'
+import { killProcessTree } from '../../utils/process-tree.js'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -35,6 +36,7 @@ const SAFE_ENV_ALLOWLIST = new Set([
 
 export const bashTool = defineTool({
   name: 'bash',
+  consequential: true,
   description:
     'Execute a bash command and return its stdout and stderr. ' +
     'Use this for file system operations, running scripts, installing packages, ' +
@@ -149,9 +151,31 @@ function runCommand(
       signal.addEventListener('abort', onAbort, { once: true })
     }
 
+    // `close` (process exited AND stdio drained) is the normal completion
+    // path. After a forced kill we settle on `exit` instead: on Windows,
+    // MSYS bash's fork emulation can leave descendants that taskkill cannot
+    // reach (their recorded parent PID is a dead intermediate process), and
+    // any such straggler would hold the stdio pipes open and delay `close`
+    // until it exits naturally.
+    //
+    // When we killed the process ourselves, report the conventional exit
+    // codes (124 timeout / 130 abort) authoritatively: the code the OS
+    // reports for a forced termination is platform-dependent (`null` after
+    // SIGKILL on POSIX, `1` after taskkill on Windows).
+    const resolveExitCode = (code: number | null): number => {
+      if (timedOut) return 124
+      if (aborted) return 130
+      return code ?? 1
+    }
+
     child.on('close', (code: number | null) => {
-      const exitCode = code ?? (timedOut ? 124 : aborted ? 130 : 1)
-      done(exitCode)
+      done(resolveExitCode(code))
+    })
+
+    child.on('exit', (code: number | null) => {
+      if (timedOut || aborted) {
+        done(resolveExitCode(code))
+      }
     })
 
     child.on('error', (err: Error) => {
@@ -169,28 +193,6 @@ function runCommand(
       }
     })
   })
-}
-
-/**
- * Kill the child and any descendants spawned through `&` / job-control on
- * POSIX. We rely on `detached: true` at spawn time, which puts the bash
- * shell in its own process group; sending SIGKILL to the negated PID
- * delivers to every member of that group.
- *
- * Windows does not have process groups; fall back to killing the direct
- * child only.
- */
-function killProcessTree(child: ChildProcess): void {
-  if (child.pid !== undefined && process.platform !== 'win32') {
-    try {
-      process.kill(-child.pid, 'SIGKILL')
-      return
-    } catch {
-      // The child may already have exited; fall through to a direct kill,
-      // which is a no-op in that case.
-    }
-  }
-  child.kill('SIGKILL')
 }
 
 function buildSafeShellEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {

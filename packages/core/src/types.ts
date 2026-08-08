@@ -7,6 +7,10 @@
 
 import type { ZodSchema } from 'zod'
 import type { SupportedProvider } from './llm/adapter.js'
+import type {
+  SchedulingStrategy,
+  SchedulingWeights,
+} from './orchestrator/scheduler.js'
 
 // ---------------------------------------------------------------------------
 // Content blocks
@@ -91,9 +95,55 @@ export interface ToolUseBlock {
 export interface ToolResultBlock {
   readonly type: 'tool_result'
   readonly tool_use_id: string
-  readonly content: string
+  readonly content: ToolResultContent
   readonly is_error?: boolean
 }
+
+/** Inline bytes or a remote reference supplied as model-visible tool output. */
+export type ToolResultMediaSource =
+  | {
+      readonly type: 'base64'
+      /** IANA media type for the encoded bytes. */
+      readonly media_type: string
+      /** Raw base64 data without a data-URL prefix. */
+      readonly data: string
+    }
+  | {
+      readonly type: 'url'
+      /** IANA media type expected at the reference. */
+      readonly media_type: string
+      /** Absolute HTTP(S) URL. Provider/model support still varies. */
+      readonly url: string
+    }
+
+/** Text part in a rich, model-visible tool result. */
+export interface ToolResultTextPart {
+  readonly type: 'text'
+  readonly text: string
+}
+
+/** Image part in a rich, model-visible tool result. */
+export interface ToolResultImagePart {
+  readonly type: 'image'
+  readonly source: ToolResultMediaSource
+}
+
+/** File part in a rich, model-visible tool result. */
+export interface ToolResultFilePart {
+  readonly type: 'file'
+  /** Display name forwarded when the provider wire format supports one. */
+  readonly filename: string
+  readonly source: ToolResultMediaSource
+}
+
+/** A part accepted inside a rich tool result. */
+export type ToolResultContentPart =
+  | ToolResultTextPart
+  | ToolResultImagePart
+  | ToolResultFilePart
+
+/** Content returned to the model for one tool call. */
+export type ToolResultContent = string | readonly ToolResultContentPart[]
 
 /** A base64-encoded image passed to or returned from a model. */
 export interface ImageBlock {
@@ -120,6 +170,23 @@ export interface LLMMessage {
   readonly role: 'user' | 'assistant'
   readonly content: ContentBlock[]
 }
+
+/**
+ * Input accepted by one-shot agent entry points.
+ *
+ * A string is shorthand for one user text message. A message list starts a
+ * fresh run with caller-owned conversation history and may include structured
+ * content such as {@link ImageBlock}s.
+ */
+export type AgentRunInput = string | readonly LLMMessage[]
+
+/**
+ * Input accepted by {@link Agent.prompt} for one persistent user turn.
+ *
+ * Use {@link AgentConfig.history} to restore earlier turns; the content-block
+ * form here is appended as exactly one new user message.
+ */
+export type AgentPromptInput = string | readonly ContentBlock[]
 
 /** Context management strategy for long-running agent conversations. */
 export type ContextStrategy =
@@ -157,6 +224,250 @@ export interface TokenUsage {
   readonly output_tokens: number
 }
 
+// ---------------------------------------------------------------------------
+// Run identity and outcome
+// ---------------------------------------------------------------------------
+
+/** Scalar trace attribute values supported by the v2 record schema. */
+export type TraceAttributeValue =
+  | string
+  | number
+  | boolean
+  | readonly string[]
+  | readonly number[]
+  | readonly boolean[]
+
+/** Stable identity for one logical run and its current execution attempt. */
+export interface RunIdentity {
+  /** Logical run identifier. Preserved across checkpoint restore. */
+  readonly runId: string
+  /** One-based execution attempt. Incremented by each restore. */
+  readonly attempt: number
+  /** W3C-compatible 32-character lowercase hexadecimal trace identifier. */
+  readonly traceId: string
+  /** W3C-compatible 16-character lowercase hexadecimal root span identifier. */
+  readonly rootSpanId: string
+  /** Continuation links, currently used by checkpoint restore. */
+  readonly links?: readonly TraceLink[]
+}
+
+/** A relationship from this execution attempt to an earlier trace. */
+export interface TraceLink {
+  readonly traceId: string
+  readonly spanId: string
+  readonly relation: 'continued_from' | 'depends_on' | 'consumed' | 'delegated_from'
+  readonly attributes?: Readonly<Record<string, TraceAttributeValue>>
+}
+
+/** Backwards-compatible identity-specific alias for {@link TraceLink}. */
+export type RunIdentityLink = TraceLink
+
+/** Caller-provided identity controls shared by all top-level execution APIs. */
+export interface RunIdentityOptions {
+  /** Optional logical run identifier (1-128 characters). */
+  readonly runId?: string
+  /**
+   * Per-run metadata, e.g. promptVersion / experiment / datasetTag.
+   * Validated, written to root span attributes as `oma.meta.<key>`,
+   * and echoed on the run result.
+   */
+  readonly metadata?: Readonly<Record<string, TraceAttributeValue>>
+}
+
+/** Per-call options for {@link OpenMultiAgent.runAgent}. */
+export interface RunAgentOptions extends RunIdentityOptions {
+  readonly abortSignal?: AbortSignal
+}
+
+export type RunStatusCode =
+  | 'ok'
+  | 'error'
+  | 'cancelled'
+  | 'timeout'
+  | 'budget_exhausted'
+  | 'rejected'
+  | 'suspended'
+  | 'skipped'
+
+/** Normalised top-level outcome. */
+export interface RunStatus {
+  readonly code: RunStatusCode
+  readonly message?: string
+}
+
+export type TraceErrorKind =
+  | 'provider'
+  | 'tool'
+  | 'framework'
+  | 'callback'
+  | 'validation'
+  | 'timeout'
+  | 'cancellation'
+  | 'budget'
+  | 'store'
+  | 'exporter'
+  | 'unknown'
+
+/** JSON-safe, redacted error details for results and future trace records. */
+export interface StructuredTraceError {
+  readonly kind: TraceErrorKind
+  readonly code?: string
+  readonly name?: string
+  readonly message?: string
+  readonly retryable?: boolean
+  readonly httpStatus?: number
+  readonly provider?: string
+  readonly attempt?: number
+}
+
+// ---------------------------------------------------------------------------
+// Durable approvals
+// ---------------------------------------------------------------------------
+
+/** Durable approval boundary represented by an {@link ApprovalRequest}. */
+export type ApprovalScope = 'plan' | 'task_round' | 'task_dispatch' | 'tool_call'
+
+/** Exact checkpoint-resumable plan payload shown to a reviewer. */
+export interface PlanApprovalContent {
+  readonly kind: 'plan'
+  /** Whether approval continues execution or returns the already-built plan. */
+  readonly continuation: 'execute' | 'plan_only'
+  readonly tasks: readonly TaskSnapshot[]
+}
+
+/** Exact checkpoint-resumable legacy-round payload shown to a reviewer. */
+export interface TaskRoundApprovalContent {
+  readonly kind: 'task_round'
+  readonly completedTasks: readonly TaskSnapshot[]
+  readonly nextTasks: readonly TaskSnapshot[]
+}
+
+/** Exact checkpoint-resumable task-dispatch payload shown to a reviewer. */
+export interface TaskDispatchApprovalContent {
+  readonly kind: 'task_dispatch'
+  readonly task: TaskSnapshot
+}
+
+/** Exact validated tool invocation shown to a reviewer. */
+export interface ToolCallApprovalContent {
+  readonly kind: 'tool_call'
+  readonly toolName: string
+  /** Model-issued input retained so restore can detect a changed request. */
+  readonly rawInput: Readonly<Record<string, unknown>>
+  /** Zod-validated input that the tool implementation will receive. */
+  readonly input: Readonly<Record<string, unknown>>
+  readonly agentName: string
+  readonly taskId: string
+  readonly toolCallId: string
+  readonly consequential: boolean
+}
+
+/** Review payload supported by the durable approval subsystem. */
+export type ApprovalRequestContent =
+  | PlanApprovalContent
+  | TaskRoundApprovalContent
+  | TaskDispatchApprovalContent
+  | ToolCallApprovalContent
+
+/** Immutable, content-bound request persisted before a run reports suspension. */
+export interface ApprovalRequest {
+  readonly version: 1
+  readonly id: string
+  readonly runId: string
+  readonly scope: ApprovalScope
+  /** Stable boundary discriminator (for example a task or tool-call id). */
+  readonly boundary: string
+  /** SHA-256 of the canonical scope/boundary/content payload. */
+  readonly requestHash: string
+  readonly requestedAt: string
+  readonly reason?: string
+  readonly content: ApprovalRequestContent
+}
+
+/** Required human or service identity attached to a durable decision. */
+export interface ApprovalReviewer {
+  readonly id: string
+  readonly displayName?: string
+}
+
+/** Primary durable fact recording who decided what and when. */
+export interface ApprovalDecisionRecord {
+  readonly version: 1
+  readonly requestId: string
+  readonly runId: string
+  readonly scope: ApprovalScope
+  readonly requestHash: string
+  readonly decision: 'approved' | 'rejected'
+  readonly reviewer: ApprovalReviewer
+  readonly decidedAt: string
+}
+
+/** Stored approval ledger row. The request remains immutable after creation. */
+export interface ApprovalRecord {
+  readonly version: 1
+  readonly request: ApprovalRequest
+  readonly decision?: ApprovalDecisionRecord
+}
+
+/** Input accepted by {@link decideApproval}. */
+export interface ApprovalDecisionInput {
+  readonly requestId: string
+  /** Reviewer-side optimistic binding to the exact request that was inspected. */
+  readonly requestHash: string
+  readonly decision: 'approve' | 'reject'
+  readonly reviewer: ApprovalReviewer
+}
+
+/** Return value accepted by plan, round, and task-dispatch approval gates. */
+export type ApprovalGateDecision = boolean | ToolCallDecision
+
+/** Additive result fields introduced by Observability v2. */
+export interface RunOutcomeFields {
+  /**
+   * Runtime results always include this field. It is optional in the first
+   * compatible 1.x type release so existing hand-written result fixtures keep
+   * compiling; it can become required in a later compatibility window.
+   */
+  readonly identity?: RunIdentity
+  /** Runtime results always include this field; see {@link identity}. */
+  readonly status?: RunStatus
+  readonly errorInfo?: StructuredTraceError
+  /** Echo of validated metadata; present at runtime whenever the caller provided it. */
+  readonly metadata?: Readonly<Record<string, TraceAttributeValue>>
+  /** Additive, machine-readable execution warnings attached by the runtime. */
+  readonly flags?: readonly RunFlag[]
+  /**
+   * True when an opt-in consequential-tool guard stopped a tool call because
+   * no application approval gate was available. Re-run with an `onToolCall`
+   * gate that returns `allow` to approve the call, or `deny` to reject it.
+   */
+  readonly confirmationRequired?: boolean
+  /** Requests that must receive durable decisions before {@link OpenMultiAgent.restore}. */
+  readonly pendingApprovals?: readonly ApprovalRequest[]
+  /** Durable decisions consumed by this logical run. */
+  readonly approvalDecisions?: readonly ApprovalDecisionRecord[]
+}
+
+/** Machine-readable warnings that describe how a run was governed. */
+export type RunFlag =
+  | 'consequential-no-independence'
+  | 'governance-overridden'
+  | 'review-skipped-due-to-budget'
+
+/** Context passed to user-supplied cost estimators. */
+export interface CostEstimateContext {
+  /** Agent whose LLM usage is being costed. */
+  readonly agentName: string
+  /** Model identifier used for the LLM call. */
+  readonly model: string
+  /** Provider used for the LLM call, when known. */
+  readonly provider?: SupportedProvider
+  /** Execution phase that produced this usage. */
+  readonly phase: 'agent' | 'routing' | 'short-circuit' | 'coordinator' | 'worker' | 'synthesis' | 'consensus' | 'delegated'
+  /** Task ID associated with the usage, when usage came from a task. */
+  readonly taskId?: string
+}
+
 /** Normalised response returned by every {@link LLMAdapter} implementation. */
 export interface LLMResponse {
   readonly id: string
@@ -184,6 +495,12 @@ export interface LLMResponse {
 export interface StreamEvent {
   readonly type: 'text' | 'reasoning' | 'tool_use' | 'tool_result' | 'loop_detected' | 'budget_exceeded' | 'done' | 'error'
   readonly data: unknown
+  /**
+   * Normalized failure metadata for an `error` event when its source is known.
+   * This lets orchestrators distinguish a provider failure from a callback or
+   * framework failure without inferring the source from the error text.
+   */
+  readonly errorInfo?: StructuredTraceError
 }
 
 // ---------------------------------------------------------------------------
@@ -240,6 +557,29 @@ export interface ToolUseContext {
   readonly cwd?: string | null
   /** Arbitrary caller-supplied metadata (session ID, request ID, etc.). */
   readonly metadata?: Readonly<Record<string, unknown>>
+  /** Run ID associated with this tool call, when available. */
+  readonly runId?: string
+  /** Task ID associated with this tool call, when available. */
+  readonly taskId?: string
+  /**
+   * Stable model-issued ID for this tool call. Mid-task checkpoint restore
+   * reuses the same ID when an uncommitted call must be executed again, so a
+   * consequential tool can use it as an external idempotency key.
+   */
+  readonly toolCallId?: string
+  /**
+   * Per-agent scoped secrets for tool code to consume (API tokens, service
+   * keys, etc.), sourced from {@link AgentConfig.credentials}. A tool reads
+   * `context.credentials?.STRIPE_KEY` instead of closing over a module-level
+   * secret, so each agent holds only the credentials it was assigned — a
+   * compromised or misbehaving subagent cannot reach another agent's secrets.
+   *
+   * This is an ergonomic scoping seam, not an isolation boundary: tool code
+   * still runs in-process and can read `process.env`. Values are treated as
+   * secrets — the `credentials` key is auto-redacted from traces and
+   * dashboards (see `utils/redaction.ts`).
+   */
+  readonly credentials?: Readonly<Record<string, string>>
 }
 
 /** Minimal descriptor for the agent that is invoking a tool. */
@@ -247,6 +587,34 @@ export interface AgentInfo {
   readonly name: string
   readonly role: string
   readonly model: string
+}
+
+/** Context passed to the optional per-call tool gate. */
+export interface ToolCallContext {
+  readonly toolName: string
+  readonly input: Record<string, unknown>
+  readonly agentName: string
+  /** True when the registered tool definition declares real side effects. */
+  readonly consequential?: boolean
+  readonly runId?: string
+  readonly taskId?: string
+  /** Stable model-issued ID for this tool call, when available. */
+  readonly toolCallId?: string
+}
+
+/** Decision returned by the optional per-call tool gate. */
+export type ToolCallDecision =
+  | { readonly action: 'allow' }
+  | { readonly action: 'deny'; readonly reason?: string }
+  | { readonly action: 'suspend'; readonly reason?: string }
+
+/** Optional middleware invoked after input validation and before tool execution. */
+export type ToolCallGate = (context: ToolCallContext) => ToolCallDecision | Promise<ToolCallDecision>
+
+/** Metadata attached to tool results when a per-call gate runs. */
+export interface ToolCallGateMetadata {
+  readonly action: ToolCallDecision['action']
+  readonly reason?: string
 }
 
 /**
@@ -276,7 +644,12 @@ export interface TeamInfo {
    * Run another roster agent to completion and return its result.
    * Only set during orchestrated pool execution (`runTeam` / `runTasks`).
    */
-  readonly runDelegatedAgent?: (targetAgent: string, prompt: string) => Promise<AgentRunResult>
+  readonly runDelegatedAgent?: (
+    targetAgent: string,
+    prompt: string,
+    /** Internal OBS-1B parent handle; callers should omit it. */
+    traceParent?: unknown,
+  ) => Promise<AgentRunResult>
 }
 
 /**
@@ -290,11 +663,29 @@ export interface ToolResultMetadata {
    * total so budgets/cost tracking stay accurate across delegation.
    */
   readonly tokenUsage?: TokenUsage
+  /** Per-call gate decision, if an onToolCall hook evaluated this tool call. */
+  readonly toolCallGate?: ToolCallGateMetadata
+  /** Internal hand-off from ToolExecutor to AgentRunner for a suspend decision. */
+  readonly approvalRequestContent?: ToolCallApprovalContent
+  /** Durable decision used instead of re-running an already-reviewed gate. */
+  readonly approvalDecision?: ApprovalDecisionRecord
+  /** Integrity error that prevented an approved tool invocation from executing. */
+  readonly approvalError?: string
 }
 
 /** Value returned by a tool's `execute` function. */
-export interface ToolResult {
-  readonly data: string
+export interface ToolResult<TData = string> {
+  /**
+   * Application-owned result. Existing tools may keep returning a string.
+   * Non-string values require an explicit {@link modelOutput} so the framework
+   * never guesses how to serialize application data for a model.
+   */
+  readonly data: TData
+  /**
+   * Optional model-visible representation, validated and defensively copied at
+   * the tool boundary. When omitted, string `data` is forwarded unchanged.
+   */
+  readonly modelOutput?: ToolResultContent
   readonly isError?: boolean
   readonly metadata?: ToolResultMetadata
 }
@@ -310,18 +701,24 @@ export interface ToolResult {
  * set and validation fails, execution returns an error ToolResult instead of
  * propagating invalid output.
  */
-export interface ToolDefinition<TInput = Record<string, unknown>> {
+export interface ToolDefinition<TInput = Record<string, unknown>, TData = string> {
   readonly name: string
   readonly description: string
   readonly inputSchema: ZodSchema<TInput>
   /**
-   * Optional runtime validator for `ToolResult.data` (always a string).
+   * Marks a tool whose grant permits real side effects. Omitted/false means
+   * benign for undeclared-run fallback classification. The runtime never
+   * infers this value from prompts, tool arguments, or keywords.
+   */
+  readonly consequential?: boolean
+  /**
+   * Optional runtime validator for the application-owned `ToolResult.data`.
    *
    * **Not to be confused with {@link AgentConfig.outputSchema}**, which
    * validates an agent's final JSON answer. This one only guards a single
-   * tool's serialised output.
+   * tool's application result.
    */
-  readonly outputSchema?: ZodSchema<string>
+  readonly outputSchema?: ZodSchema<TData>
   /**
    * When present, used as {@link LLMToolDef.inputSchema} as-is instead of
    * deriving JSON Schema from `inputSchema` (Zod).
@@ -333,7 +730,7 @@ export interface ToolDefinition<TInput = Record<string, unknown>> {
    * Takes priority over {@link AgentConfig.maxToolOutputChars}.
    */
   readonly maxOutputChars?: number
-  execute(input: TInput, context: ToolUseContext): Promise<ToolResult>
+  execute(input: TInput, context: ToolUseContext): Promise<ToolResult<TData>>
 }
 
 // ---------------------------------------------------------------------------
@@ -346,36 +743,186 @@ export interface ToolDefinition<TInput = Record<string, unknown>> {
  *
  * - `budgetTokens` maps to Anthropic's `thinking.budget_tokens` and Gemini's
  *   `thinkingConfig.thinkingBudget`.
- * - `effort` maps to OpenAI o-series / gpt-5 `reasoning_effort`. Carried as
- *   an explicit value rather than derived from `budgetTokens` so the call
- *   site stays unambiguous across providers.
+ * - `effort` maps to OpenAI-compatible `reasoning_effort`, including
+ *   DeepSeek's `high` / `max` levels. It is carried as an explicit value
+ *   rather than derived from `budgetTokens` so the call site stays
+ *   unambiguous across providers.
  *
- * The `effort` union is intentionally narrowed to the values declared by
- * the pinned `openai` SDK (`'low' | 'medium' | 'high'`). Newer values
- * shipped by the API but not yet in the SDK type union (e.g. gpt-5's
- * `'minimal'`, GPT-5.5's `'none'`) should be passed via `extraBody:
- * { reasoning_effort: '<value>' }`, matching how `top_k` / `min_p` are
- * handled for vLLM.
+ * The union includes DeepSeek's `max` value in addition to the common
+ * OpenAI-compatible levels. Other provider-specific values not declared
+ * here (for example `'minimal'` or `'none'`) should be passed via
+ * `extraBody: { reasoning_effort: '<value>' }`, matching how `top_k` /
+ * `min_p` are handled for vLLM.
  *
  * Adapters that don't recognise a given field ignore it.
  */
 export interface ThinkingConfig {
   readonly enabled: boolean
   readonly budgetTokens?: number
-  readonly effort?: 'low' | 'medium' | 'high'
+  readonly effort?: 'low' | 'medium' | 'high' | 'max'
 }
 
 /** Context passed to the {@link AgentConfig.beforeRun} hook. */
 export interface BeforeRunHookContext {
-  /** The user prompt text. */
+  /**
+   * Text blocks from the latest user message, concatenated in block order.
+   * Kept for backwards-compatible text-only rewrites.
+   */
   readonly prompt: string
+  /**
+   * A defensive copy of the complete effective message list.
+   * Return a replacement list to rewrite structured input or caller history.
+   */
+  readonly messages: readonly LLMMessage[]
   /** The agent's static configuration. */
   readonly agent: AgentConfig
 }
 
+/** Value returned by {@link AgentConfig.beforeRun}. */
+export interface BeforeRunHookResult {
+  /**
+   * Backwards-compatible text rewrite for the latest user message. When both
+   * `messages` and `prompt` change, `messages` is applied first and `prompt`
+   * then replaces that message's text blocks while preserving non-text order.
+   */
+  readonly prompt: string
+  /**
+   * Optional replacement for the complete message list. Omission preserves
+   * compatibility with hooks that predate structured run input.
+   */
+  readonly messages?: readonly LLMMessage[]
+  /** Read-only informational agent configuration. */
+  readonly agent: AgentConfig
+}
+
+/**
+ * A minimal, SDK-agnostic view of an ACP `session/request_permission` prompt,
+ * passed to a {@link AcpAgentBackendConfig.permission} callback so callers can decide
+ * without importing `@agentclientprotocol/sdk`.
+ */
+export interface AcpPermissionRequest {
+  /** Human-readable title of the pending tool call (e.g. `"Edit src/app.ts"`). */
+  readonly title: string
+  /** ACP tool kind when the agent provides one (e.g. `'edit'`, `'execute'`, `'read'`). */
+  readonly kind?: string
+  /** The option kinds the agent offered (e.g. `'allow_once'`, `'reject_always'`). */
+  readonly optionKinds: readonly string[]
+}
+
+/**
+ * How an ACP-backed agent answers a permission prompt. OMA runs agents
+ * autonomously inside a task DAG, so the default is `'auto-approve'`.
+ *  - `'auto-approve'` — select an `allow_*` option, preferring the least-privilege
+ *    `allow_once` over a session-wide `allow_always` (falls back to cancel).
+ *  - `'reject'` — select a `reject_*` option, preferring `reject_once` (falls back to cancel).
+ *  - function — decide per request; `true` approves, `false` rejects.
+ */
+export type AcpPermissionPolicy =
+  | 'auto-approve'
+  | 'reject'
+  | ((request: AcpPermissionRequest) => boolean | Promise<boolean>)
+
+/**
+ * Configuration for running an external agent over the Agent Client Protocol
+ * (ACP) as an OMA team member — see {@link AgentConfig.backend}. The agent is a
+ * local subprocess (a coding CLI such as Gemini CLI or Claude Code) that runs its
+ * own agentic loop, while OMA drives it, collects its output and token usage, and
+ * schedules it in the task DAG alongside LLM agents.
+ *
+ * Requires the optional peer `@agentclientprotocol/sdk`.
+ */
+export interface AgentBackendConfig {
+  /** Backend discriminant. */
+  readonly kind: 'acp'
+  /** Executable to spawn (e.g. `'npx'`, `'gemini'`, `'codex-acp'`). */
+  readonly command: string
+  /** Arguments passed to `command` (e.g. `['-y', '@agentclientprotocol/claude-agent-acp']`). */
+  readonly args?: readonly string[]
+  /** Extra environment variables for the subprocess, merged over `process.env`. */
+  readonly env?: Readonly<Record<string, string>>
+  /**
+   * Working directory the agent reads and edits. Defaults to `process.cwd()`.
+   * Unlike OMA's filesystem-tool sandbox, an ACP agent accesses this directory
+   * directly — scope it to a project you trust the external agent with.
+   */
+  readonly cwd?: string
+  /** How to answer the agent's permission prompts. Defaults to `'auto-approve'`. */
+  readonly permission?: AcpPermissionPolicy
+}
+
+/** Alias for the ACP backend config; `AgentBackendConfig` is kept for v1.10 compatibility. */
+export interface AcpAgentBackendConfig extends AgentBackendConfig {}
+
+/** How a generic process backend receives a prompt. */
+export type ProcessBackendInputMode = 'stdin' | 'argument' | 'none'
+
+/**
+ * Configuration for running a generic local process as an OMA team member.
+ *
+ * Unlike ACP, this backend does not speak an agent protocol. It starts a fresh
+ * process per run, sends the prompt by stdin or final argument, maps stdout to
+ * the agent output, and treats non-zero exits as task failures.
+ */
+export interface ProcessAgentBackendConfig {
+  /** Backend discriminant. */
+  readonly kind: 'process'
+  /** Executable to spawn (e.g. `'node'`, `'python'`, `'my-cli'`). */
+  readonly command: string
+  /** Arguments passed to `command` before the prompt argument, if any. */
+  readonly args?: readonly string[]
+  /** Extra environment variables for the subprocess, merged over `process.env`. */
+  readonly env?: Readonly<Record<string, string>>
+  /** Working directory for the subprocess. Defaults to `process.cwd()`. */
+  readonly cwd?: string
+  /**
+   * Prompt delivery mode. Defaults to `'stdin'`.
+   * - `'stdin'`: write the prompt to stdin and close it.
+   * - `'argument'`: append the prompt as the final command argument.
+   * - `'none'`: do not send the prompt; useful for fixed command adapters.
+   */
+  readonly input?: ProcessBackendInputMode
+}
+
+/** External backend configuration keyed by `kind`. */
+export type ExternalAgentBackendConfig = AgentBackendConfig | ProcessAgentBackendConfig
+
 /** Static configuration for a single agent. */
 export interface AgentConfig {
   readonly name: string
+  /**
+   * Previously persisted conversation messages to restore for prompt() calls.
+   *
+   * The messages are validated and defensively deep-copied when the Agent is
+   * constructed, so a caller can safely reuse or mutate the serialized history
+   * after passing it in. The history should contain the same valid message
+   * sequence returned by Agent.getHistory().
+   */
+  readonly history?: readonly LLMMessage[]
+  /** One-sentence role description for bounded, structured agent manifests. */
+  readonly description?: string
+  /**
+   * Caller-declared capability tags used as explicit selection signals.
+   * OMA never derives capabilities from `systemPrompt` or any other text.
+   */
+  readonly capabilities?: readonly string[]
+  /**
+   * Caller-declared relative cost class. `low`, `medium`, and `high` are
+   * application-level bands; OMA does not infer pricing when this is omitted.
+   */
+  readonly costTier?: 'low' | 'medium' | 'high'
+  /**
+   * Caller-declared relative response-time class. `low`, `medium`, and `high`
+   * describe expected latency; OMA does not benchmark or infer a default.
+   */
+  readonly latencyClass?: 'low' | 'medium' | 'high'
+  /**
+   * Caller-declared permission or trust boundary for this agent.
+   *
+   * Equal values mean the application considers two agents to share one
+   * boundary. OMA never derives this value from prompts, tools, credentials, or
+   * runtime behavior. It is used only as a structured routing/governance fact.
+   */
+  readonly permissionBoundary?: string
   /**
    * Model identifier (e.g. `'claude-opus-4-6'`).
    *
@@ -392,6 +939,17 @@ export interface AgentConfig {
    * and `region` are ignored for LLM calls.
    */
   readonly adapter?: LLMAdapter
+  /**
+   * Run this agent on an external {@link ExternalAgentBackendConfig} instead of
+   * an LLM adapter. When set, the
+   * LLM-specific fields (`model`, `provider`, `adapter`, sampling, tools, context
+   * strategy) do not apply — the external agent runs its own loop — but the agent
+   * still participates in the task DAG, shared memory, cascade-on-failure, and
+   * token budget like any other team member. ACP backends require the optional
+   * peer `@agentclientprotocol/sdk`; generic process backends use Node child
+   * processes and do not require an optional peer.
+   */
+  readonly backend?: ExternalAgentBackendConfig
   readonly provider?: SupportedProvider
   /**
    * Custom base URL for OpenAI-compatible APIs (Ollama, vLLM, LM Studio, etc.).
@@ -413,13 +971,32 @@ export interface AgentConfig {
    * will throw at registration time.
    */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  readonly customTools?: readonly ToolDefinition<any>[]
+  readonly customTools?: readonly ToolDefinition<any, any>[]
   /** Names of tools (from the tool registry) available to this agent. */
   readonly tools?: readonly string[]
   /** Names of tools explicitly disallowed for this agent. */
   readonly disallowedTools?: readonly string[]
+  /**
+   * Optional per-call tool gate. Called after tool input validates and before
+   * execution. Return `{ action: 'deny' }` to surface an error ToolResult to the
+   * model without throwing or invoking the tool implementation.
+   */
+  readonly onToolCall?: ToolCallGate
   /** Predefined tool preset for common use cases. */
   readonly toolPreset?: 'readonly' | 'readwrite' | 'full'
+  /**
+   * Per-agent scoped secrets made available to tool code via
+   * {@link ToolUseContext.credentials}. Give each agent only the credentials
+   * it needs (e.g. a `researcher` gets a search-API key, a `publisher` gets a
+   * CMS token) instead of closing a single shared secret over every tool.
+   * Never merged across agents and never inherited from the coordinator: an
+   * agent holds exactly the bag set here, or none.
+   *
+   * A scoping convenience, not a sandbox — tool code runs in-process and can
+   * still read `process.env`. Values are treated as secrets: the `credentials`
+   * key is auto-redacted from traces and dashboards.
+   */
+  readonly credentials?: Readonly<Record<string, string>>
   /**
    * Root directory used by built-in filesystem tools (`file_read`,
    * `file_write`, `file_edit`, `grep`, `glob`). Paths must be absolute and
@@ -496,9 +1073,12 @@ export interface AgentConfig {
    *   (`includeThoughts` defaults on when enabled).
    * - OpenAI: forwards `effort` as `reasoning_effort` (o-series, gpt-5).
    *   The `enabled`/`budgetTokens` fields are ignored — OpenAI's reasoning
-   *   surface is qualitative (`effort`), not quantitative.
-   * - All other providers (Bedrock, local servers, etc.): ignored. Use
-   *   {@link extraBody} for provider-specific reasoning controls instead.
+   *   surface is qualitative (`effort`), not quantitative. The
+   *   DeepSeek-specific `max` value is ignored.
+   * - DeepSeek: forwards `enabled` as `thinking.type` and `effort` as
+   *   `reasoning_effort`; `max` is supported.
+   * - All other provider-specific fields (Bedrock, local servers, etc.) are
+   *   ignored. Use {@link extraBody} for controls not represented here.
    */
   readonly thinking?: ThinkingConfig
   /**
@@ -507,6 +1087,22 @@ export interface AgentConfig {
    * Useful for local models where inference can be unpredictably slow.
    */
   readonly timeoutMs?: number
+  /**
+   * Maximum wall-clock time (in milliseconds) for a **single** LLM call
+   * (one `adapter.chat()` request), re-armed fresh for every model call the
+   * agent makes. Unset (the default) leaves each call bound only by the vendor
+   * SDK's own request timeout, which is inconsistent across providers and
+   * absent for some (a stalled provider can then hang the whole run).
+   *
+   * When set, OMA merges an `AbortSignal.timeout()` into each call so the bound
+   * is uniform across every adapter and composes with {@link timeoutMs} (the
+   * whole-run bound) — whichever fires first wins. A per-call timeout surfaces
+   * as an {@link LLMCallTimeoutError}, distinct from a caller `abortSignal`
+   * cancellation. Because OMA calls the model non-streaming internally, this is
+   * a wall-clock deadline over the entire response, so keep it generous for
+   * slow local models or large reasoning outputs.
+   */
+  readonly callTimeoutMs?: number
   /**
    * Loop detection configuration. When set, the agent tracks repeated tool
    * calls and text outputs to detect stuck loops before `maxTurns` is reached.
@@ -593,16 +1189,18 @@ export interface AgentConfig {
    * retry with error feedback is attempted on validation failure.
    *
    * **Distinct from {@link ToolDefinition.outputSchema}**, which validates an
-   * individual tool's `ToolResult.data` string. This one operates on the
-   * agent's final answer as parsed JSON.
+   * individual tool's application-owned `ToolResult.data`. This schema operates
+   * on the agent's final answer as parsed JSON.
    */
   readonly outputSchema?: ZodSchema
   /**
-   * Called before each agent run. Receives the prompt and agent config.
+   * Called before each agent run. Receives a defensive copy of the complete
+   * messages plus the backwards-compatible text `prompt` view and agent config.
    * Return a (possibly modified) context to continue, or throw to abort the run.
-   * Only `prompt` from the returned context is applied; `agent` is read-only informational.
+   * `messages` is applied first, then a changed `prompt`; `agent` is read-only
+   * informational. External process/ACP backends support `prompt` rewrites only.
    */
-  readonly beforeRun?: (context: BeforeRunHookContext) => Promise<BeforeRunHookContext> | BeforeRunHookContext
+  readonly beforeRun?: (context: BeforeRunHookContext) => Promise<BeforeRunHookResult> | BeforeRunHookResult
   /**
    * Called after each agent run completes successfully. Receives the run result.
    * Return a (possibly modified) result, or throw to mark the run as failed.
@@ -664,7 +1262,7 @@ export interface ToolCallRecord {
 }
 
 /** The final result produced when an agent run completes (or fails). */
-export interface AgentRunResult {
+export interface AgentRunResult extends RunOutcomeFields {
   readonly success: boolean
   readonly output: string
   readonly messages: LLMMessage[]
@@ -680,6 +1278,14 @@ export interface AgentRunResult {
   readonly loopDetected?: boolean
   /** True when the run stopped because token budget was exceeded. */
   readonly budgetExceeded?: boolean
+  /**
+   * The underlying thrown error when `success` is false due to an exception
+   * (e.g. a provider `APIError` carrying `.status`), preserved so retry logic
+   * can classify it as retryable vs terminal. `undefined` for app-level
+   * failures. In-process only — collapses to `{}` if the result is
+   * JSON-serialized.
+   */
+  readonly error?: unknown
 }
 
 // ---------------------------------------------------------------------------
@@ -715,6 +1321,13 @@ export interface ModelRouteConfig {
   readonly apiKey?: string
   /** AWS region selected for Bedrock routes. */
   readonly region?: string
+  /**
+   * Ordered fallback routes to try on retryable provider errors.
+   *
+   * The first entry becomes active on the next retry after the primary route
+   * fails; later retries advance through the list in order. Empty by default.
+   */
+  readonly fallback?: readonly ModelRouteConfig[]
 }
 
 /** Deterministic, predicate-free route selector for a model routing rule. */
@@ -744,6 +1357,32 @@ export interface ModelRoutingPolicy {
   readonly rules: readonly ModelRoutingRule[]
 }
 
+/**
+ * Explicit hard requirements for task-to-agent selection.
+ *
+ * Hard constraints use only resolved tool grants, backend discriminants,
+ * providers, and caller-declared capability tags. They are never inferred
+ * from `systemPrompt`, task prose, names, or other unstructured text.
+ */
+export interface TaskRequirements {
+  readonly requiredTools?: readonly string[]
+  readonly requiredCapabilities?: readonly string[]
+  readonly requiredBackend?: 'llm' | 'process' | 'acp'
+  readonly requiredProvider?: SupportedProvider
+}
+
+/** Structured reason why a task cannot satisfy its hard requirements. */
+export interface TaskRequirementIssue {
+  readonly code: 'NO_ELIGIBLE_AGENT' | 'ASSIGNEE_REQUIREMENTS_MISMATCH'
+  readonly taskId: string
+  readonly taskTitle: string
+  readonly assignee?: string
+  readonly reasons: readonly string[]
+}
+
+/** Bounded, trace-safe business references attached to one task. */
+export type TaskMetadata = Readonly<Record<string, TraceAttributeValue>>
+
 /** Input task descriptor accepted by {@link OpenMultiAgent.runTasks}. */
 export interface RunTaskSpec {
   readonly title: string
@@ -751,21 +1390,146 @@ export interface RunTaskSpec {
   readonly assignee?: string
   readonly dependsOn?: string[]
   readonly memoryScope?: 'dependencies' | 'all'
+  /**
+   * Payload injected for each direct dependency.
+   *
+   * Defaults to `output` for backwards compatibility. `structured` injects
+   * only the dependency's validated structured value; `both` labels and
+   * injects both forms.
+   */
+  readonly dependencyPayload?: 'output' | 'structured' | 'both'
+  /**
+   * Bounded business references such as `sourceFile`, `supplierId`, or
+   * `documentId`. Values are validated and credential-like content is redacted
+   * before entering task results, traces, or checkpoints.
+   */
+  readonly metadata?: TaskMetadata
   readonly maxRetries?: number
   readonly retryDelayMs?: number
   readonly retryBackoff?: number
   readonly role?: string
   readonly priority?: 'low' | 'normal' | 'high' | 'critical'
+  /** Optional explicit hard requirements. Omitted means no hard constraints. */
+  readonly requires?: TaskRequirements
   readonly verify?: ConsensusVerifyOptions
 }
 
+/** One task appended by an opt-in runtime plan repair. */
+export interface PlanPatchTaskSpec extends RunTaskSpec {
+  /**
+   * Patch-local stable key. Dependencies of another appended task may refer to
+   * this key; dependencies on the existing graph must use a task id.
+   */
+  readonly key: string
+}
+
+/** Reassign a task that has not started. */
+export interface PlanPatchRetarget {
+  readonly taskId: string
+  readonly assignee: string
+}
+
+/**
+ * Append-only repair of the not-yet-executed portion of a task graph.
+ *
+ * Existing topology is immutable. Replacing a branch means superseding its
+ * pending/blocked nodes and appending replacement tasks with new dependencies.
+ */
+export interface PlanPatch {
+  readonly reason: string
+  readonly addTasks?: readonly PlanPatchTaskSpec[]
+  readonly retargetPending?: readonly PlanPatchRetarget[]
+  readonly supersedePending?: readonly string[]
+}
+
+/** Accepted description of one runtime plan repair. */
+export interface PlanRevision {
+  readonly id: string
+  readonly version: number
+  readonly triggerTaskId: string
+  readonly trigger: 'success' | 'failure' | 'verification_rejected'
+  readonly reason: string
+  readonly addedTasks: Readonly<Record<string, string>>
+  readonly retargetedTasks: readonly PlanPatchRetarget[]
+  readonly supersededTaskIds: readonly string[]
+  readonly createdAt: string
+}
+
+/** Verification facts exposed to a recovery policy without judge credentials. */
+export interface TaskVerificationOutcome {
+  readonly verdict: 'accepted' | 'rejected'
+  readonly dissent: readonly string[]
+  readonly rounds: number
+}
+
+/** Stable facts available at the task-outcome recovery barrier. */
+export interface TaskOutcome {
+  readonly kind: 'success' | 'failure' | 'verification_rejected'
+  readonly task: Readonly<Task>
+  readonly result: Readonly<AgentRunResult>
+  readonly verification?: TaskVerificationOutcome
+  readonly planRevision: number
+  readonly tasks: readonly Readonly<Task>[]
+  readonly tokenBudgetRemaining?: number
+  readonly costBudgetRemaining?: number
+}
+
+/** Policy object that can propose an append-only repair at a task outcome barrier. */
+export interface Replanner {
+  readonly name?: string
+  replan(
+    outcome: TaskOutcome,
+  ): PlanPatch | undefined | Promise<PlanPatch | undefined>
+}
+
+/**
+ * Opt-in runtime plan repair. Omitted or `mode: 'fixed'` preserves the exact
+ * existing DAG lifecycle.
+ */
+export interface RecoveryOptions {
+  readonly mode?: 'fixed' | 'repairable'
+  /**
+   * Called before the triggering task is completed or failed, so no dependent
+   * can be dispatched ahead of an accepted patch.
+   */
+  readonly onTaskOutcome?: (
+    outcome: TaskOutcome,
+  ) => PlanPatch | undefined | Promise<PlanPatch | undefined>
+  /**
+   * First-class replanner policy. Mutually exclusive with `onTaskOutcome`.
+   * The application owns any external I/O performed by a custom replanner.
+   */
+  readonly replanner?: Replanner
+  /** Approval gate for a validated patch. Omitted means the policy owns approval. */
+  readonly onPlanPatch?: (
+    patch: Readonly<PlanPatch>,
+    outcome: TaskOutcome,
+  ) => boolean | Promise<boolean>
+  /** Maximum accepted revisions in one run. Default `3`. */
+  readonly maxPlanRevisions?: number
+  /** Maximum cumulative tasks appended by revisions. Default `20`. */
+  readonly maxAddedTasks?: number
+}
+
 /** Per-call options for {@link OpenMultiAgent.runTasks}. */
-export interface RunTasksOptions {
+export interface RunTasksOptions extends RunIdentityOptions {
   readonly abortSignal?: AbortSignal
   /**
-   * Opt-in durable task checkpointing. When enabled, the orchestrator writes a
-   * checkpoint after each successfully completed task using the configured
-   * {@link MemoryStore}. Defaults to off.
+   * Optional per-run token ceiling. When an orchestrator-level
+   * {@link OrchestratorConfig.maxTokenBudget} is also set, the lower ceiling
+   * wins. Enforcement reuses the existing turn/task-boundary accounting.
+   */
+  readonly maxTokenBudget?: number
+  /**
+   * Optional per-run cost ceiling in the application-defined cost unit. When
+   * an orchestrator-level {@link OrchestratorConfig.maxCostBudget} is also set,
+   * the lower ceiling wins. Requires {@link OrchestratorConfig.estimateCost}.
+   */
+  readonly maxCostBudget?: number
+  /**
+   * Opt-in durable checkpointing. When enabled, the orchestrator writes a
+   * checkpoint at safe in-flight agent boundaries and after each successfully
+   * completed task using the configured {@link MemoryStore}. Defaults to off.
    *
    * `true` uses the team's shared-memory store when available, otherwise a
    * private in-memory store for the run. Pass an object to provide a durable
@@ -777,6 +1541,190 @@ export interface RunTasksOptions {
    * coordinator model selection is unchanged.
    */
   readonly modelRouting?: ModelRoutingPolicy
+  /**
+   * Opt-in runtime repair policy. `runFromPlan()` rejects non-fixed recovery so
+   * a frozen plan remains an exact replay contract.
+   */
+  readonly recovery?: RecoveryOptions
+}
+
+/**
+ * A privacy-preserving roster entry supplied to an {@link ExecutionRouter}.
+ *
+ * This is intentionally smaller than {@link AgentConfig}: in particular it
+ * never contains `systemPrompt`. A later capability model may add structured
+ * fields without exposing full prompts.
+ */
+export interface RosterSummaryEntry {
+  readonly name: string
+  readonly model: string
+  /** Count of directly declared built-in and custom tools, when known. */
+  readonly toolCount?: number
+  /** Bounded role summary for manifest consumers; execution routing leaves this unset. */
+  readonly roleSummary?: string
+  /** Caller-declared capability tags; never inferred from `systemPrompt`. */
+  readonly capabilities?: readonly string[]
+  /** Caller-declared relative cost band. */
+  readonly costTier?: AgentConfig['costTier']
+  /** Caller-declared relative response-time band. */
+  readonly latencyClass?: AgentConfig['latencyClass']
+}
+
+/** Budget still available when execution routing begins. */
+export interface RoutingBudget {
+  readonly tokenRemaining?: number
+  readonly costRemaining?: number
+}
+
+/** Stable, language-neutral inputs available to an {@link ExecutionRouter}. */
+export interface RoutingContext {
+  readonly goal: string
+  readonly roster: readonly RosterSummaryEntry[]
+  readonly budget?: RoutingBudget
+  /** Allows custom routers to stop work when the run or routing deadline aborts. */
+  readonly abortSignal?: AbortSignal
+}
+
+/** Structured outcome when an execution router cannot supply its requested decision. */
+export type RoutingDecisionStatus = 'selected' | 'fallback'
+
+/** Machine-readable reason why a router decision fell back. */
+export type RoutingFallbackCode =
+  | 'invalid-router-version'
+  | 'invalid-decision'
+  | 'router-error'
+  | 'router-timeout'
+
+/** Explainable single-agent or team-topology decision. */
+export interface RoutingDecision {
+  readonly mode: 'single' | 'team'
+  readonly confidence?: number
+  readonly reasons: readonly string[]
+  readonly routerVersion: string
+  /** Omitted on caller-constructed decisions for backwards compatibility. */
+  readonly status?: RoutingDecisionStatus
+  /** Version requested before a fallback selected another router. */
+  readonly requestedRouterVersion?: string
+  /** Present only when {@link status} is `fallback`. */
+  readonly fallbackCode?: RoutingFallbackCode
+}
+
+/** Model-inferred semantic signals. These are routing evidence, never governance truth. */
+export interface TaskProfile {
+  readonly evidenceSources: 'single' | 'multiple' | 'unknown'
+  readonly independentReview: 'none' | 'preferred' | 'required'
+  readonly conflictingObjectives: boolean
+  readonly sideEffectIntent: 'none' | 'possible' | 'required'
+  readonly permissionIsolation: 'none' | 'preferred' | 'required'
+  readonly decomposable: boolean
+  readonly parallelizable: boolean
+  readonly complexity: 'low' | 'medium' | 'high'
+  readonly confidence: number
+  readonly reasons: readonly string[]
+  readonly source: 'inferred'
+}
+
+/** Inputs exposed to a semantic task profiler. */
+export interface TaskProfilerContext {
+  readonly goal: string
+  readonly roster: readonly RosterSummaryEntry[]
+  readonly budget?: RoutingBudget
+  readonly abortSignal?: AbortSignal
+}
+
+/** Result returned by a semantic task profiler. */
+export interface TaskProfilerResult {
+  readonly profile: TaskProfile
+  /** Usage is optional for custom non-LLM profilers. */
+  readonly usage?: TokenUsage
+  /** Effective model/provider facts when the profiler used an LLM. */
+  readonly model?: string
+  readonly provider?: string
+}
+
+/** Provider-neutral semantic task profiler. */
+export interface TaskProfiler {
+  readonly version: string
+  profile(context: TaskProfilerContext): TaskProfilerResult | Promise<TaskProfilerResult>
+}
+
+export type ExecutionRoutingStrategy = 'hybrid' | 'deterministic'
+export type RoutingFailurePolicy = 'fallback' | 'fail'
+
+/** Hybrid execution-routing controls shared by orchestrator and per-run config. */
+export interface ExecutionRoutingConfig {
+  /** Defaults to `deterministic`. Set `hybrid` to opt into semantic profiling. */
+  readonly strategy?: ExecutionRoutingStrategy
+  /** Custom profiler. When omitted, OMA builds an {@link LLMTaskProfiler}. */
+  readonly profiler?: TaskProfiler
+  /** Model used by the built-in profiler. Defaults to the effective coordinator/default model. */
+  readonly model?: string
+  /** Adapter used by the built-in profiler. */
+  readonly adapter?: LLMAdapter
+  /** Minimum accepted semantic confidence. Defaults to `0.7`. */
+  readonly confidenceThreshold?: number
+  /** Shared router/profiler deadline in milliseconds. */
+  readonly timeoutMs?: number
+  /** Defaults to `fallback`; `fail` makes routing infrastructure fail closed. */
+  readonly failurePolicy?: RoutingFailurePolicy
+}
+
+export type SemanticRoutingRecommendation = 'single' | 'team' | 'needs-declaration'
+export type SemanticRoutingOutcome = 'applied' | 'fallback'
+
+/** Observable semantic assessment; it does not claim that governance occurred. */
+export interface SemanticRoutingAssessment {
+  /** Effective profiler version; `none` when no valid profile was produced. */
+  readonly profilerVersion: string
+  /** Version requested before a Profiler fallback, when it was identifiable. */
+  readonly requestedProfilerVersion?: string
+  readonly profile?: TaskProfile
+  readonly model?: string
+  readonly provider?: string
+  readonly legacyMode: 'single'
+  readonly recommendation: SemanticRoutingRecommendation
+  readonly actualMode?: RoutingDecision['mode']
+  readonly outcome: SemanticRoutingOutcome
+  readonly usage?: TokenUsage
+  /** Caller-defined estimated cost unit, when an estimator is configured. */
+  readonly estimatedCost?: number
+  readonly fallbackCode?: 'profiler-error' | 'profiler-timeout' | 'invalid-profile' | 'profiler-unavailable'
+}
+
+/** Why a `runTeam()` execution topology was selected. */
+export type ExecutionRoutingDecisionSource =
+  | 'override'
+  | 'declared'
+  | 'policy'
+  | 'router'
+  | 'legacy-deterministic'
+
+/**
+ * Observable routing fact attached to a `runTeam()` result.
+ *
+ * `routerVersion` is present only when `source` is `router` (or when reading a
+ * serialized legacy-deterministic record). Non-router paths remain explicit
+ * rather than impersonating a router decision.
+ */
+export interface ExecutionRoutingDecisionRecord {
+  readonly decisionId: string
+  readonly receiptId: string
+  readonly traceSpanId?: string
+  readonly source: ExecutionRoutingDecisionSource
+  readonly mode: RoutingDecision['mode']
+  readonly confidence?: number
+  readonly reasons: readonly string[]
+  readonly routerVersion?: string
+  readonly status?: RoutingDecisionStatus
+  readonly requestedRouterVersion?: string
+  readonly fallbackCode?: RoutingFallbackCode
+  readonly semanticRoutingAssessment?: SemanticRoutingAssessment
+}
+
+/** Pluggable execution-topology policy for automatic `runTeam()` calls. */
+export interface ExecutionRouter {
+  readonly version: string
+  decide(context: RoutingContext): RoutingDecision | Promise<RoutingDecision>
 }
 
 /**
@@ -786,16 +1734,81 @@ export interface RunTasksOptions {
 export interface RunTeamOptions extends RunTasksOptions {
   readonly coordinator?: CoordinatorConfig
   /**
-   * When true, the coordinator decomposes the goal but no task agents run.
-   * The returned {@link TeamRunResult} has `planOnly: true`, `success: true`,
-   * `tasks` populated (all `pending`, no metrics), and `agentResults`
-   * containing only the coordinator's decomposition call. `totalTokenUsage`
-   * reflects the coordinator only.
+   * Application-selected execution mode for this invocation.
    *
-   * Bypasses the simple-goal short-circuit so the coordinator always runs.
+   * `'single'` always uses the existing best-agent path. `'team'` forces the
+   * existing coordinator-generated team path and bypasses the simple-goal
+   * short circuit.
    *
-   * If {@link OrchestratorConfig.onPlanReady} is wired up and returns false,
-   * the rejection wins: result is `success: false` and `planOnly` is undefined.
+   * This application choice takes precedence over {@link governanceIntent}.
+   * If the selected mode fails a declared `required` floor, execution is kept
+   * but the result is disclosed as governance `unsatisfied` / `overridden`.
+   * Selecting a mode does not count as declaring governance intent, so
+   * consequential confirmation still applies when `governanceIntent` is
+   * omitted.
+   */
+  readonly mode?: 'single' | 'team'
+  /**
+   * Per-run execution router override.
+   *
+   * Precedence is: explicit {@link mode} > declared governance policy
+   * (`governanceIntent` / `preferredUnderBudget`) > this router > the
+   * orchestrator's router (the built-in deterministic router by default).
+   * Routers run only for automatic, non-`planOnly` topology selection and
+   * never override the first two layers.
+   */
+  readonly executionRouter?: ExecutionRouter
+  /** Per-run override for hybrid semantic execution routing. */
+  readonly executionRouting?: ExecutionRoutingConfig
+  /**
+   * Optional structured governance signal for this goal.
+   *
+   * `'required'` and `'preferred'` both bypass coordinator decomposition and
+   * the simple-goal short circuit. Instead, `runTeam()` executes one task per
+   * {@link requiredRoles} entry using the declared roster assignments.
+   * `'none'` and an omitted value preserve the existing automatic routing
+   * behavior.
+   *
+   * When combined with {@link planOnly}, the declared role topology is built
+   * and validated but not executed; `planOnly` wins.
+   */
+  readonly governanceIntent?: 'required' | 'preferred' | 'none'
+  /**
+   * Agent names from the team roster that must execute independent tasks when
+   * {@link governanceIntent} is `'required'` or `'preferred'`.
+   */
+  readonly requiredRoles?: readonly string[]
+  /**
+   * Optional execution order for {@link requiredRoles}. When provided, it must
+   * be a permutation of `requiredRoles`; each role depends on the previous one.
+   * When omitted, the declared role tasks have no dependencies and may run in
+   * parallel.
+   */
+  readonly requiredOrder?: readonly string[]
+  /**
+   * Application policy for a `preferred` declaration when a token or cost
+   * ceiling applies to the run.
+   *
+   * `'attempt'` (the default) preserves the existing declared-role topology.
+   * `'degrade'` chooses the Single path up front and attaches the
+   * `review-skipped-due-to-budget` disclosure flag. It does not predict model
+   * cost or attempt a pre-run fit estimate.
+   */
+  readonly preferredUnderBudget?: 'attempt' | 'degrade'
+  /**
+   * When true, returns a validated plan without running task agents. The
+   * returned {@link TeamRunResult} has `planOnly: true`, `success: true`, and
+   * `tasks` populated (all `pending`, no metrics).
+   *
+   * With `governanceIntent: 'required' | 'preferred'`, no coordinator or task
+   * agent runs; the validated declared-role topology is returned instead, and
+   * `governanceConclusion` is `'not-applicable'`. Otherwise, `planOnly`
+   * bypasses the simple-goal short circuit and runs only the coordinator
+   * decomposition call, which is reflected in `agentResults` and token usage.
+   *
+   * For coordinator-generated plans, if {@link OrchestratorConfig.onPlanReady}
+   * is wired up and returns false, the rejection wins: result is
+   * `success: false` and `planOnly` is undefined.
    */
   readonly planOnly?: boolean
   /**
@@ -832,11 +1845,61 @@ export interface RunTeamOptions extends RunTasksOptions {
   readonly verifyJudges?: readonly AgentConfig[]
 }
 
+/** Post-execution result of comparing required governance with execution facts. */
+export type GovernanceConclusion = 'satisfied' | 'unsatisfied' | 'not-applicable'
+
+/** Known application/budget causes for an unsatisfied governance conclusion. */
+export type GovernanceUnsatisfiedReason = 'overridden' | 'budget'
+
+/** Run-level aggregated metrics summary. */
+export interface RunMetrics {
+  /**
+   * All usage charged to the run, including semantic-routing usage when Hybrid
+   * routing profiles a deterministic Single candidate. It may therefore exceed
+   * the sum of task-level `metrics.tokenUsage`.
+   */
+  readonly totalTokens: TokenUsage
+  readonly totalRetries: number
+  readonly errorCount: number
+  readonly failureCount: number
+  readonly completedCount: number
+  readonly minTaskDurationMs?: number
+  readonly maxTaskDurationMs?: number
+  readonly avgTaskDurationMs?: number
+  readonly totalDurationMs: number
+}
+
 /** Aggregated result for a full team run. */
-export interface TeamRunResult {
+export interface TeamRunResult extends RunOutcomeFields {
   readonly success: boolean
+  /**
+   * Explainable topology decision for this `runTeam()` invocation.
+   *
+   * Runtime results set this on routed, overridden, declared, and policy
+   * paths. It remains optional so older serialized results and caller-created
+   * fixtures continue to type-check.
+   */
+  readonly routingDecision?: ExecutionRoutingDecisionRecord
+  /** Present only when the hybrid semantic profiler evaluated a Single candidate. */
+  readonly semanticRoutingAssessment?: SemanticRoutingAssessment
+  /**
+   * Post-execution governance verdict for this run.
+   *
+   * OMA-produced results always set this field. It remains optional on the
+   * interface so older serialized results and caller-created fixtures continue
+   * to type-check. `success` retains its existing runtime-error semantics.
+   */
+  readonly governanceConclusion?: GovernanceConclusion
+  /**
+   * Machine-readable cause when a required governance floor is unsatisfied by
+   * an explicit application override or by budget exhaustion. Omitted for a
+   * satisfied/not-applicable conclusion and for other execution failures.
+   */
+  readonly governanceReason?: GovernanceUnsatisfiedReason
   readonly goal?: string
   readonly tasks?: readonly TaskExecutionRecord[]
+  /** Accepted append-only runtime plan revisions, in application order. */
+  readonly planRevisions?: readonly PlanRevision[]
   /**
    * True when the run was a plan-only invocation (`runTeam(team, goal, { planOnly: true })`).
    * The coordinator decomposed the goal but no task agents executed.
@@ -845,7 +1908,18 @@ export interface TeamRunResult {
   readonly planOnly?: boolean
   /** Keyed by agent name. */
   readonly agentResults: Map<string, AgentRunResult>
+  /**
+   * Unmerged per-task results keyed by stable task id.
+   *
+   * Runtime-produced task runs populate this map while retaining
+   * {@link agentResults} for backwards compatibility. It remains optional so
+   * older serialized results and caller-authored fixtures continue to
+   * type-check.
+   */
+  readonly taskResults?: Map<string, AgentRunResult>
   readonly totalTokenUsage: TokenUsage
+  /** Aggregated run-level metrics computed from per-task data. */
+  readonly metrics?: RunMetrics
 }
 
 /** A single serializable task in a deterministic replay plan. */
@@ -856,9 +1930,14 @@ export interface PlanTaskArtifact {
   readonly assignee?: string
   readonly dependsOn?: readonly string[]
   readonly memoryScope?: 'dependencies' | 'all'
+  readonly dependencyPayload?: 'output' | 'structured' | 'both'
+  readonly role?: string
+  readonly priority?: 'low' | 'normal' | 'high' | 'critical'
+  readonly metadata?: TaskMetadata
   readonly maxRetries?: number
   readonly retryDelayMs?: number
   readonly retryBackoff?: number
+  readonly requires?: TaskRequirements
 }
 
 /**
@@ -899,13 +1978,14 @@ export interface ConsensusVerifyOptions {
 }
 
 /** Options for {@link OpenMultiAgent.runConsensus}. */
-export interface ConsensusOptions extends ConsensusVerifyOptions {
+export interface ConsensusOptions extends ConsensusVerifyOptions, RunIdentityOptions {
   /** Proposer agent(s). An array runs all (N-best); usage counts against the parent budget. */
   readonly proposer: AgentConfig | readonly AgentConfig[]
+  readonly abortSignal?: AbortSignal
 }
 
 /** Result of a consensus run (or per-task `verify` hook). */
-export interface ConsensusResult {
+export interface ConsensusResult extends RunOutcomeFields {
   readonly answer: string
   /** `accepted` when quorum was reached (or `onDissent: 'keep'`); else `rejected`. */
   readonly verdict: 'accepted' | 'rejected'
@@ -933,6 +2013,7 @@ export interface TaskExecutionMetrics {
   readonly durationMs: number
   readonly tokenUsage: TokenUsage
   readonly toolCalls: AgentRunResult['toolCalls']
+  readonly retries: number
 }
 
 /** Serializable task snapshot embedded in the static HTML dashboard. */
@@ -949,11 +2030,21 @@ export interface TaskExecutionRecord {
    * task; `undefined` when the task did not set them.
    */
   readonly memoryScope?: 'dependencies' | 'all'
+  readonly dependencyPayload?: 'output' | 'structured' | 'both'
+  /** Logical business role, distinct from the concrete worker in `assignee`. */
+  readonly role?: string
+  readonly priority?: 'low' | 'normal' | 'high' | 'critical'
+  readonly metadata?: TaskMetadata
   readonly maxRetries?: number
   readonly retryDelayMs?: number
   readonly retryBackoff?: number
+  readonly requires?: TaskRequirements
   /** Verify config attached to this task, if any. Populated in `planOnly` results for inspection. */
   readonly verify?: ConsensusVerifyOptions
+  /** Plan revision that logically superseded this unstarted task. */
+  readonly supersededByRevision?: number
+  /** Plan revision that repaired this task's failed/rejected outcome. */
+  readonly recoveredByRevision?: number
   readonly metrics?: TaskExecutionMetrics
 }
 
@@ -973,10 +2064,19 @@ export interface Task {
    * - `all`: full shared-memory summary
    */
   readonly memoryScope?: 'dependencies' | 'all'
+  /**
+   * Selects the representation of direct dependency results injected into the
+   * task prompt. Defaults to `output`.
+   */
+  readonly dependencyPayload?: 'output' | 'structured' | 'both'
   /** Caller-defined task role used by model routing rules. */
   readonly role?: string
   /** Caller-defined task priority used by model routing rules. */
   readonly priority?: 'low' | 'normal' | 'high' | 'critical'
+  /** Validated, bounded business references carried through result/trace/checkpoint. */
+  readonly metadata?: TaskMetadata
+  /** Explicit hard requirements enforced before assignment and execution. */
+  readonly requires?: TaskRequirements
   result?: string
   readonly createdAt: Date
   updatedAt: Date
@@ -992,6 +2092,10 @@ export interface Task {
    * parent `maxTokenBudget`. Tasks without `verify` run unchanged.
    */
   readonly verify?: ConsensusVerifyOptions
+  /** Plan revision that logically superseded this unstarted task. */
+  readonly supersededByRevision?: number
+  /** Plan revision that repaired this task's failed/rejected outcome. */
+  readonly recoveredByRevision?: number
 }
 
 // ---------------------------------------------------------------------------
@@ -1001,8 +2105,8 @@ export interface Task {
 /**
  * Progress event emitted by the orchestrator during a run.
  *
- * **v0.3 addition:** `'task_skipped'` — consumers with exhaustive switches
- * on `type` will need to add a case for this variant.
+ * Additive variants include `'task_skipped'` and `'warning'`; consumers with
+ * exhaustive switches on `type` need to handle them.
  */
 export interface OrchestratorEvent {
   readonly type:
@@ -1012,8 +2116,12 @@ export interface OrchestratorEvent {
     | 'task_complete'
     | 'task_skipped'
     | 'task_retry'
+    | 'approval_pending'
+    | 'plan_revision'
+    | 'recovery_decision'
     | 'budget_exceeded'
     | 'message'
+    | 'warning'
     | 'error'
   readonly agent?: string
   readonly task?: string
@@ -1024,12 +2132,85 @@ export interface OrchestratorEvent {
 export interface OrchestratorConfig {
   readonly maxConcurrency?: number
   /**
+   * Strategy used to assign unassigned tasks to team agents:
+   *
+   * - `'round-robin'` distributes tasks evenly in roster order; use it when
+   *   agents are interchangeable.
+   * - `'least-busy'` prefers the agent with the fewest active tasks; use it to
+   *   balance work when task duration varies.
+   * - `'capability-match'` ranks eligible agents using declared capabilities
+   *   and task affinity; use it when agents have distinct roles.
+   * - `'dependency-first'` assigns tasks that unblock the most dependents
+   *   first; use it for dependency-heavy DAGs.
+   * - `'composite'` ranks by dependency criticality, hard-filters with the
+   *   AgentSelector, then combines fit and current load.
+   *
+   * All strategies hard-filter explicit task requirements before ranking.
+   * Defaults to `'dependency-first'`. Explicit task assignees are preserved
+   * and must satisfy any declared requirements.
+   */
+  readonly schedulingStrategy?: SchedulingStrategy
+  /**
+   * Relative weights for `'composite'` scheduling.
+   *
+   * `fit` multiplies the AgentSelector score and defaults to `0.7`. `load`
+   * multiplies `1 - normalizedCurrentLoad` and defaults to `0.3`. Values must
+   * be finite and non-negative, and may not both be zero. Ignored by the four
+   * compatibility strategies.
+   */
+  readonly schedulingWeights?: Partial<SchedulingWeights>
+  /**
+   * Reject coordinator plans that name an assignee outside the team roster.
+   *
+   * Defaults to `true`: coordinator output that names an unknown agent is
+   * rejected before task execution. Set to `false` only to retain legacy
+   * behavior that clears the assignment and lets the scheduler choose.
+   */
+  readonly strictAssignees?: boolean
+  /**
+   * Default execution-topology router for automatic `runTeam()` calls.
+   *
+   * Precedence is: per-call explicit mode > declared governance policy >
+   * per-call router > this router > the built-in deterministic router.
+   * Routing is orthogonal to {@link RunTeamOptions.modelRouting}: execution
+   * routing chooses Single versus Team topology, while model routing chooses
+   * models inside that topology.
+   */
+  readonly executionRouter?: ExecutionRouter
+  /**
+   * Default execution-routing configuration.
+   *
+   * Omitted means `strategy: 'deterministic'`. Set
+   * `{ strategy: 'hybrid' }` to opt into semantic profiling.
+   */
+  readonly executionRouting?: ExecutionRoutingConfig
+  /**
    * Maximum depth of `delegate_to_agent` chains from a task run (default `3`).
    * Depth is per nested delegated run, not per team.
    */
   readonly maxDelegationDepth?: number
   /** Maximum cumulative tokens (input + output) allowed per orchestrator run. */
   readonly maxTokenBudget?: number
+  /**
+   * Maximum estimated run cost allowed for an orchestrator-managed run.
+   *
+   * Requires {@link estimateCost}. The framework intentionally does not ship a
+   * model price table; callers own provider-specific pricing. Checked at the
+   * same turn/task boundaries as {@link maxTokenBudget}, so a run may overshoot
+   * by up to one model turn and should not be treated as a cent-exact stop.
+   */
+  readonly maxCostBudget?: number
+  /**
+   * Converts incremental token usage into a caller-defined cost unit.
+   *
+   * Called with usage from one LLM result, not cumulative usage. Return the
+   * amount to add to the run's cumulative estimated cost. The context includes
+   * the effective model after defaults and model routing.
+   */
+  readonly estimateCost?: (
+    usage: TokenUsage,
+    context: CostEstimateContext,
+  ) => number
   /**
    * Default model inherited by every agent that does not set its own
    * {@link AgentConfig.model} — workers, the coordinator, and consensus agents
@@ -1046,6 +2227,8 @@ export interface OrchestratorConfig {
    * and `restore`. Per-call options override this value. Defaults to off.
    */
   readonly checkpoint?: boolean | CheckpointOptions
+  /** Default opt-in runtime repair policy. Per-run recovery replaces it. */
+  readonly recovery?: RecoveryOptions
   /**
    * Fallback tool grant for agents that declare neither {@link AgentConfig.tools}
    * nor {@link AgentConfig.toolPreset}. Built-in tools are opt-in (default-deny):
@@ -1068,14 +2251,37 @@ export interface OrchestratorConfig {
    */
   readonly defaultCwd?: string | null
   readonly onProgress?: (event: OrchestratorEvent) => void
+  /** Best-effort online scoring of settled top-level runs. Disabled unless configured. */
+  readonly evaluation?: import('./eval/online.js').OnlineEvaluationConfig
+  /** Observability v2 sinks. User code owns forceFlush/shutdown lifecycle. */
+  readonly observability?: import('./observability/sink.js').ObservabilityConfig
   readonly onTrace?: (event: TraceEvent) => void | Promise<void>
+  /**
+   * Optional per-call tool gate inherited by agents that do not define their own
+   * {@link AgentConfig.onToolCall}. This is a coordination layer, not a sandbox
+   * or security boundary.
+   */
+  readonly onToolCall?: ToolCallGate
+  /**
+   * Opt in to confirmation for consequential tool calls in `runAgent()` and
+   * automatic `runTeam()` runs that omit `governanceIntent`.
+   *
+   * When enabled, an existing `onToolCall` gate decides each consequential
+   * invocation. A dynamically planned `runTeam()` may also inherit approval
+   * from `onPlanReady`. Without either approval path, the tool is not executed
+   * and the result carries `confirmationRequired: true`. Defaults to false.
+   */
+  readonly requireConsequentialConfirmation?: boolean
   /**
    * Optional approval gate called between task execution rounds.
    *
    * After a batch of tasks completes, this callback receives all
    * completed {@link Task}s from that round and the list of tasks about
-   * to start next. Return `true` to continue or `false` to abort —
-   * remaining tasks will be marked `'skipped'`.
+   * to start next. Return `true`/`allow` to continue, `false`/`deny` to abort,
+   * or `suspend` to persist this exact boundary for a later decision.
+   *
+   * Configuring this callback selects the legacy round-based executor. It is
+   * mutually exclusive with {@link onTaskDispatch}.
    *
    * Not called when:
    * - No tasks succeeded in the round (all failed).
@@ -1085,13 +2291,36 @@ export interface OrchestratorConfig {
    * callback — they are live references to queue state. Mutation is
    * undefined behavior.
    */
-  readonly onApproval?: (completedTasks: readonly Task[], nextTasks: readonly Task[]) => Promise<boolean>
+  readonly onApproval?: (
+    completedTasks: readonly Task[],
+    nextTasks: readonly Task[],
+  ) => ApprovalGateDecision | Promise<ApprovalGateDecision>
+  /**
+   * Optional per-task dispatch gate for event-driven DAG execution.
+   *
+   * Called after a ready task has an assignee and immediately before it is
+   * dispatched. Return `true`/`allow` to start the task, `false`/`deny` to stop
+   * new dispatches, or `suspend` to persist this exact task for a later
+   * decision. On rejection, already-running tasks are allowed to settle and
+   * every remaining task is then marked `'skipped'`.
+   *
+   * This gate is mutually exclusive with {@link onApproval}. Configure
+   * `onApproval` to retain legacy round-by-round execution and approval
+   * semantics; configure `onTaskDispatch` for native pipeline approval.
+   *
+   * **Note:** Do not mutate the {@link Task} passed to this callback. It is a
+   * live reference to queue state; mutation is undefined behavior.
+   */
+  readonly onTaskDispatch?: (
+    task: Readonly<Task>,
+  ) => ApprovalGateDecision | Promise<ApprovalGateDecision>
   /**
    * Optional approval gate called once after the coordinator decomposes the
    * goal into tasks and before execution begins.
    *
-   * Receives the full plan as a {@link Task} array. Return `true` to proceed
-   * or `false` to abort. A thrown callback is treated as an abort.
+   * Receives the full plan as a {@link Task} array. Return `true`/`allow` to
+   * proceed, `false`/`deny` to abort, or `suspend` to persist the exact plan for
+   * a later decision. A thrown callback is treated as an abort.
    *
    * Only invoked by `runTeam()`. `runAgent()` and `runTasks()` are
    * unaffected. The `TeamRunResult` returned on abort still reflects the
@@ -1101,7 +2330,9 @@ export interface OrchestratorConfig {
    * callback. They are live references to queue state; mutation is
    * undefined behavior.
    */
-  readonly onPlanReady?: (tasks: readonly Task[]) => Promise<boolean>
+  readonly onPlanReady?: (
+    tasks: readonly Task[],
+  ) => ApprovalGateDecision | Promise<ApprovalGateDecision>
   /**
    * Called for each streaming event emitted by an agent during runTeam().
    * When provided, agents run in streaming mode so the TUI can receive
@@ -1161,6 +2392,28 @@ export interface SharedMemorySnapshot {
   readonly entries: readonly MemoryEntrySnapshot[]
 }
 
+/** Serializable form of an inter-agent message. */
+export interface MessageSnapshot {
+  readonly id: string
+  readonly from: string
+  readonly to: string
+  readonly content: string
+  readonly timestamp: string
+}
+
+/** Serializable read-state for one agent on the MessageBus. */
+export interface MessageReadStateSnapshot {
+  readonly agentName: string
+  readonly messageIds: readonly string[]
+}
+
+/** Serializable form of MessageBus state. Runtime subscribers are not persisted. */
+export interface MessageBusSnapshot {
+  readonly version: 1
+  readonly messages: readonly MessageSnapshot[]
+  readonly readState: readonly MessageReadStateSnapshot[]
+}
+
 /** Serializable form of a {@link Task}. */
 export interface TaskSnapshot {
   readonly id: string
@@ -1170,18 +2423,23 @@ export interface TaskSnapshot {
   readonly assignee?: string
   readonly dependsOn?: readonly string[]
   readonly memoryScope?: 'dependencies' | 'all'
+  readonly dependencyPayload?: 'output' | 'structured' | 'both'
   readonly role?: string
   readonly priority?: 'low' | 'normal' | 'high' | 'critical'
+  readonly metadata?: TaskMetadata
+  readonly requires?: TaskRequirements
   readonly result?: string
   readonly createdAt: string
   readonly updatedAt: string
   readonly maxRetries?: number
   readonly retryDelayMs?: number
   readonly retryBackoff?: number
+  readonly supersededByRevision?: number
+  readonly recoveredByRevision?: number
 }
 
-/** Serializable state of a {@link TaskQueue}. */
-export interface TaskQueueSnapshot {
+/** Legacy serializable state of a {@link TaskQueue}. */
+export interface TaskQueueSnapshotV1 {
   readonly version: 1
   readonly tasks: readonly TaskSnapshot[]
   readonly pending: readonly string[]
@@ -1192,22 +2450,94 @@ export interface TaskQueueSnapshot {
   readonly skipped: readonly string[]
 }
 
+/** Serializable adaptive-plan state of a {@link TaskQueue}. */
+export interface TaskQueueSnapshotV2 {
+  readonly version: 2
+  readonly tasks: readonly TaskSnapshot[]
+  readonly pending: readonly string[]
+  readonly inProgress: readonly string[]
+  readonly completed: readonly string[]
+  readonly failed: readonly string[]
+  readonly blocked: readonly string[]
+  readonly skipped: readonly string[]
+  readonly planRevision: number
+  readonly planRevisions: readonly PlanRevision[]
+}
+
+/** Serializable state of a {@link TaskQueue}. */
+export type TaskQueueSnapshot = TaskQueueSnapshotV1 | TaskQueueSnapshotV2
+
 /** Result recorded for a completed task inside a checkpoint. */
 export interface CompletedTaskCheckpoint {
   readonly taskId: string
   readonly assignee?: string
   readonly result?: string
+  /**
+   * Full JSON-serializable task result. The in-process-only `error` object is
+   * deliberately omitted; normalized `status` / `errorInfo` remain available.
+   */
+  readonly agentResult?: Omit<AgentRunResult, 'error'>
 }
 
-/** Full persisted checkpoint for a task-based run. */
-export interface CheckpointSnapshot {
-  readonly version: 1
-  readonly mode: 'runTeam' | 'runTasks'
+/** A tool result durably recorded before an in-flight task completes. */
+export interface ToolCallCommitCheckpoint {
+  /** Result block replayed to the model without re-executing the tool. */
+  readonly result: ToolResultBlock
+  /** Public tool-call record carried into the eventual agent result. */
+  readonly record: ToolCallRecord
+  /** Nested-agent usage returned by tools such as `delegate_to_agent`. */
+  readonly delegationUsage?: TokenUsage
+}
+
+/** One model-requested tool call in an in-flight assistant turn. */
+export interface PendingToolCallCheckpoint {
+  readonly call: ToolUseBlock
+  /** Present only after the tool returned and its result was checkpointed. */
+  readonly commit?: ToolCallCommitCheckpoint
+  /** Present while this exact validated invocation awaits or consumes review. */
+  readonly approvalRequest?: ApprovalRequest
+  /** Decision loaded from the primary approval ledger during restore. */
+  readonly approvalDecision?: ApprovalDecisionRecord
+}
+
+/**
+ * Serializable runner state for one task that has started but is not yet
+ * reflected in the queue's completed-task partition.
+ */
+export interface InFlightTaskCheckpoint {
+  readonly taskId: string
+  readonly assignee: string
+  /** The next safe action when this state is restored. */
+  readonly phase: 'awaiting_model' | 'executing_tools' | 'completed'
+  /** Full model context, including the task's initial user message. */
+  readonly conversationMessages: readonly LLMMessage[]
+  /** Messages produced by the runner, excluding the initial user message. */
+  readonly messages: readonly LLMMessage[]
+  readonly tokenUsage: TokenUsage
+  readonly toolCalls: readonly ToolCallRecord[]
+  /** Number of completed model turns. */
+  readonly turns: number
+  /** Present while an assistant tool-use turn is being committed. */
+  readonly pendingToolCalls?: readonly PendingToolCallCheckpoint[]
+  /** Optional warning text appended beside the pending tool results. */
+  readonly pendingToolResultText?: string
+  /** Final assistant output when `phase` is `completed`. */
+  readonly finalOutput?: string
+  /** Whether loop detection has already injected its first warning. */
+  readonly loopWarned?: boolean
+  readonly loopDetected?: boolean
+  readonly budgetExceeded?: boolean
+}
+
+interface CheckpointSnapshotBase {
+  readonly mode: 'runTeam' | 'runTasks' | 'runFromPlan'
   readonly createdAt: string
-  readonly runId?: string
+  /** Validated per-run metadata inherited by future restore attempts. */
+  readonly metadata?: Readonly<Record<string, TraceAttributeValue>>
   readonly goal?: string
   readonly queue: TaskQueueSnapshot
   readonly sharedMemory?: SharedMemorySnapshot
+  readonly messageBus?: MessageBusSnapshot
   /**
    * Shared-memory turn counter at checkpoint time. Persisted separately from
    * {@link sharedMemory} so TTL/expiry stays correct on resume even when the
@@ -1216,6 +2546,51 @@ export interface CheckpointSnapshot {
   readonly turnCount?: number
   readonly completedTaskResults: readonly CompletedTaskCheckpoint[]
 }
+
+/** Legacy checkpoint schema, retained for read compatibility. */
+export interface CheckpointSnapshotV1 extends CheckpointSnapshotBase {
+  readonly version: 1
+  readonly runId?: string
+}
+
+/** Identity persisted by identity-aware checkpoint schemas (v2 and later). */
+export interface CheckpointRunIdentity {
+  readonly runId: string
+  readonly attempt: number
+  readonly lastTraceId: string
+  readonly lastRootSpanId: string
+}
+
+/** Legacy identity-aware checkpoint schema, retained for read compatibility. */
+export interface CheckpointSnapshotV2 extends CheckpointSnapshotBase {
+  readonly version: 2
+  readonly identity: CheckpointRunIdentity
+}
+
+/** Legacy checkpoint schema with mid-task runner recovery. */
+export interface CheckpointSnapshotV3 extends CheckpointSnapshotBase {
+  readonly version: 3
+  readonly identity: CheckpointRunIdentity
+  readonly inFlightTasks: readonly InFlightTaskCheckpoint[]
+}
+
+/** Current checkpoint schema with durable approval continuation state. */
+export interface CheckpointSnapshotV4 extends CheckpointSnapshotBase {
+  readonly version: 4
+  readonly identity: CheckpointRunIdentity
+  readonly inFlightTasks: readonly InFlightTaskCheckpoint[]
+  /** Requests whose reviewed boundary has not yet been consumed by execution. */
+  readonly pendingApprovals: readonly ApprovalRequest[]
+  /** Durable decisions already consumed or ready to be consumed by this run. */
+  readonly approvalDecisions: readonly ApprovalDecisionRecord[]
+}
+
+/** Full persisted checkpoint for a task-based run. */
+export type CheckpointSnapshot =
+  | CheckpointSnapshotV1
+  | CheckpointSnapshotV2
+  | CheckpointSnapshotV3
+  | CheckpointSnapshotV4
 
 /**
  * Optional overrides for the temporary coordinator agent created by `runTeam`.
@@ -1275,6 +2650,8 @@ export interface CoordinatorConfig {
   readonly tools?: readonly string[]
   /** Tool names explicitly denied to the coordinator. */
   readonly disallowedTools?: readonly string[]
+  /** See {@link AgentConfig.onToolCall}. */
+  readonly onToolCall?: ToolCallGate
   /**
    * Root directory used by the coordinator's filesystem tools.
    * Defaults to {@link OrchestratorConfig.defaultCwd}. Pass `null` to
@@ -1283,6 +2660,8 @@ export interface CoordinatorConfig {
   readonly cwd?: string | null
   readonly loopDetection?: LoopDetectionConfig
   readonly timeoutMs?: number
+  /** See {@link AgentConfig.callTimeoutMs}. Bounds each coordinator LLM call. */
+  readonly callTimeoutMs?: number
 }
 
 // ---------------------------------------------------------------------------
@@ -1298,11 +2677,16 @@ export type TraceEventType =
   | 'plan_ready'
   | 'agent_stream'
   | 'consensus'
+  | 'routing_decision'
 
 /** Shared fields present on every trace event. */
 export interface TraceEventBase {
   /** Unique identifier for the entire run (runTeam / runTasks / runAgent call). */
   readonly runId: string
+  /** Unique identifier for this span within the run. */
+  readonly spanId: string
+  /** Span ID of the causal parent, when the framework can determine one. */
+  readonly parentId?: string
   readonly type: TraceEventType
   /** Unix epoch ms when the span started. */
   readonly startMs: number
@@ -1331,6 +2715,12 @@ export interface ToolCallTrace extends TraceEventBase {
   readonly type: 'tool_call'
   readonly tool: string
   readonly isError: boolean
+  /** True when an onToolCall gate evaluated this tool invocation. */
+  readonly gated?: boolean
+  /** Decision returned by the gate, when one evaluated this call. */
+  readonly gateAction?: ToolCallDecision['action']
+  /** Optional denial/debug reason supplied by the gate. */
+  readonly gateReason?: string
   /** The input arguments passed to the tool after best-effort sensitive-field redaction. */
   readonly input: Record<string, unknown>
   /** The serialised output returned by the tool after executor truncation and best-effort sensitive-value redaction. */
@@ -1342,6 +2732,8 @@ export interface TaskTrace extends TraceEventBase {
   readonly type: 'task'
   readonly taskId: string
   readonly taskTitle: string
+  readonly taskRole?: string
+  readonly taskMetadata?: TaskMetadata
   readonly success: boolean
   readonly retries: number
 }
@@ -1379,6 +2771,22 @@ export interface ConsensusTrace extends TraceEventBase {
   readonly dissent?: string
 }
 
+/** Emitted when `runTeam()` selects its execution topology. */
+export interface RoutingDecisionTrace extends TraceEventBase {
+  readonly type: 'routing_decision'
+  readonly decisionId: string
+  readonly receiptId: string
+  readonly source: ExecutionRoutingDecisionSource
+  readonly mode: RoutingDecision['mode']
+  readonly confidence?: number
+  readonly reasons: readonly string[]
+  readonly routerVersion?: string
+  readonly status?: RoutingDecisionStatus
+  readonly requestedRouterVersion?: string
+  readonly fallbackCode?: RoutingFallbackCode
+  readonly semanticRoutingAssessment?: SemanticRoutingAssessment
+}
+
 /** Discriminated union of all trace event types. */
 export type TraceEvent =
   | LLMCallTrace
@@ -1388,6 +2796,7 @@ export type TraceEvent =
   | PlanReadyTrace
   | AgentStreamTrace
   | ConsensusTrace
+  | RoutingDecisionTrace
 
 // ---------------------------------------------------------------------------
 // Memory
@@ -1433,6 +2842,18 @@ export interface MemoryEntry {
 export interface MemoryStore {
   get(key: string): Promise<MemoryEntry | null>
   set(key: string, value: string, metadata?: Record<string, unknown>): Promise<void>
+  /**
+   * Optional atomic compare-and-set used by durable approval decisions.
+   * `expectedValue: null` means the key must not exist. Implementations that
+   * cannot make the comparison and write atomic across their supported writer
+   * scope must omit this method; suspendable approvals fail closed without it.
+   */
+  compareAndSet?(
+    key: string,
+    expectedValue: string | null,
+    value: string,
+    metadata?: Record<string, unknown>,
+  ): Promise<boolean>
   /**
    * Optional: write an entry with a turn-count expiry. Stores that don't
    * implement this method silently lose TTL semantics — callers (e.g.

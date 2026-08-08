@@ -54,17 +54,89 @@
 // Orchestrator (primary entry point)
 // ---------------------------------------------------------------------------
 
-export { OpenMultiAgent, executeWithRetry, computeRetryDelay } from './orchestrator/orchestrator.js'
-export { Scheduler } from './orchestrator/scheduler.js'
-export type { SchedulingStrategy } from './orchestrator/scheduler.js'
+export {
+  OpenMultiAgent,
+  DeterministicRouter,
+  executeWithRetry,
+  computeRetryDelay,
+} from './orchestrator/orchestrator.js'
+export {
+  evaluateSemanticRoutingPolicy,
+  HYBRID_ROUTER_VERSION,
+  LLMTaskProfiler,
+  taskProfileSchema,
+  TaskProfileValidationError,
+  validateTaskProfilerResult,
+} from './orchestrator/task-profiler.js'
+export type {
+  ExecutionRouter,
+  ExecutionRoutingDecisionRecord,
+  ExecutionRoutingDecisionSource,
+  RoutingBudget,
+  RoutingContext,
+  RoutingDecision,
+  RoutingDecisionStatus,
+  RoutingFallbackCode,
+  RosterSummaryEntry,
+} from './orchestrator/execution-router.js'
+export {
+  evaluateGovernance,
+  GOVERNANCE_OVERRIDDEN_FLAG,
+  REVIEW_SKIPPED_DUE_TO_BUDGET_FLAG,
+} from './orchestrator/governance.js'
+export type { GovernanceDeclaration } from './orchestrator/governance.js'
+export { CONSEQUENTIAL_NO_INDEPENDENCE_FLAG } from './orchestrator/consequential.js'
+export {
+  Scheduler,
+  DEFAULT_SCHEDULING_WEIGHTS,
+} from './orchestrator/scheduler.js'
+export type {
+  SchedulingStrategy,
+  SchedulingWeights,
+  SchedulerOptions,
+  SchedulerWarning,
+} from './orchestrator/scheduler.js'
+export {
+  AgentSelector,
+  validateTaskRequirements,
+} from './orchestrator/agent-selector.js'
+export type {
+  AgentSelectionFailure,
+  AgentSelectionResult,
+  AgentSelectionSubject,
+  AgentSelectorContext,
+  EligibleAgentScore,
+} from './orchestrator/agent-selector.js'
 
 export { renderTeamRunDashboard } from './dashboard/render-team-run-dashboard.js'
+export { renderRunViewer } from './dashboard/render-run-viewer.js'
+export { RunViewerInputError, buildRunViewerModel } from './dashboard/run-viewer-model.js'
+export type {
+  RunViewerDagLayout,
+  RunViewerEvent,
+  RunViewerFact,
+  RunViewerInput,
+  RunViewerInputErrorCode,
+  RunViewerLink,
+  RunViewerModel,
+  RunViewerRoutingSummary,
+  RunViewerOptions,
+  RunViewerSourceMode,
+  RunViewerSpan,
+  RunViewerStatus,
+  RunViewerSummary,
+  RunViewerTask,
+  RunViewerWarning,
+} from './dashboard/run-viewer-model.js'
 
 // ---------------------------------------------------------------------------
 // Agent layer
 // ---------------------------------------------------------------------------
 
 export { Agent } from './agent/agent.js'
+// The execution seam behind every Agent. `AgentRunner` (the LLM loop) implements
+// it; the ACP backend (`@open-multi-agent/core/acp`) is an alternative impl.
+export type { AgentBackend, RunOptions, RunResult } from './agent/runner.js'
 export { LoopDetector } from './agent/loop-detector.js'
 export { buildStructuredOutputInstruction, extractJSON, validateOutput } from './agent/structured-output.js'
 export { AgentPool, Semaphore } from './agent/pool.js'
@@ -92,7 +164,7 @@ export type { TaskQueueEvent } from './task/queue.js'
 
 export { defineTool, ToolRegistry, zodToJsonSchema } from './tool/framework.js'
 export { ToolExecutor, truncateToolOutput } from './tool/executor.js'
-export type { ToolExecutorOptions, BatchToolCall } from './tool/executor.js'
+export type { ToolExecutorExecutionOptions, ToolExecutorOptions, BatchToolCall } from './tool/executor.js'
 export {
   registerBuiltInTools,
   BUILT_IN_TOOLS,
@@ -113,14 +185,109 @@ export type { RegisterBuiltInToolsOptions } from './tool/built-in/index.js'
 
 export { createAdapter } from './llm/adapter.js'
 export type { SupportedProvider } from './llm/adapter.js'
-export { TokenBudgetExceededError, InvalidMessageError } from './errors.js'
+export {
+  TokenBudgetExceededError,
+  CostBudgetExceededError,
+  InvalidMessageError,
+  InvalidTaskRequirementsError,
+  LLMCallTimeoutError,
+  UnsupportedToolCallError,
+  UnsupportedToolResultContentError,
+  RoutingDeclarationRequiredError,
+  RoutingProfilerFailedError,
+  RoutingTimeoutError,
+  isRetryableError,
+} from './errors.js'
+export { createRunIdentity, createRestoreIdentity, validateRunId } from './observability/identity.js'
+export { classifyRunFailure } from './observability/status.js'
+export type {
+  SpanEndRecord,
+  SpanEventName,
+  SpanEventRecord,
+  SpanKind,
+  SpanStartRecord,
+  TraceRecord,
+  TraceRecordBase,
+} from './observability/records.js'
+export {
+  BatchingTraceSink,
+  CompositeSink,
+  DEFAULT_BATCHING_OPTIONS,
+  DiagnosticReporter,
+  FilteringSink,
+  InMemoryTraceStore,
+  LegacyCallbackTraceSink,
+  SensitiveDataProcessor,
+  TRACE_STORE_SCHEMA_MAJOR,
+  TraceStoreError,
+  TraceStoreExporter,
+  buildExecutionReceipt,
+  emptyTraceSinkStats,
+  materializeRun,
+} from './observability/index.js'
+export type {
+  AppendResult,
+  BatchingTraceSinkOptions,
+  DeleteResult,
+  DiagnosticMode,
+  DiagnosticOptions,
+  ExportResult,
+  ExecutionReceipt,
+  ExecutionReceiptApprovalDecision,
+  ExecutionReceiptDependencyEdge,
+  FlushOptions,
+  FlushResult,
+  GetRunOptions,
+  InMemoryTraceStoreOptions,
+  MaterializedSpan,
+  ObservabilityConfig,
+  ObservabilityResource,
+  Page,
+  RetentionPolicy,
+  RunAttemptSummary,
+  RunCostSummary,
+  RunSummary,
+  RunTokenSummary,
+  SensitiveDataProcessorOptions,
+  TelemetryDiagnostic,
+  TelemetryDiagnosticCode,
+  TraceCapturePolicy,
+  TraceDeleteQuery,
+  TraceExporter,
+  TraceFilter,
+  TraceQuery,
+  TraceSink,
+  TraceSinkStats,
+  TraceStore,
+  TraceStoreDiagnostic,
+  TraceStoreDiagnosticCode,
+  TraceStoreErrorCode,
+  StoredRun,
+} from './observability/index.js'
 
 // ---------------------------------------------------------------------------
 // Memory
 // ---------------------------------------------------------------------------
 
 export { InMemoryStore } from './memory/store.js'
+export { FileStore } from './memory/file-store.js'
+export { RedactingStore } from './memory/redacting-store.js'
+export type { RedactingStoreOptions } from './memory/redacting-store.js'
 export { SharedMemory } from './memory/shared.js'
+export {
+  APPROVAL_KEY_PREFIX,
+  DurableApprovalError,
+  DurableApprovalLedger,
+  approvalKey,
+  createApprovalRequest,
+  decideApproval,
+  getApprovalRecord,
+  hashApprovalRequest,
+} from './approval/durable.js'
+export type {
+  CreateApprovalRequestInput,
+  DurableApprovalErrorCode,
+} from './approval/durable.js'
 export {
   Checkpoint,
   CHECKPOINT_KEY_PREFIX,
@@ -139,6 +306,12 @@ export type {
   TextBlock,
   ToolUseBlock,
   ToolResultBlock,
+  ToolResultContent,
+  ToolResultContentPart,
+  ToolResultFilePart,
+  ToolResultImagePart,
+  ToolResultMediaSource,
+  ToolResultTextPart,
   ImageBlock,
   ContentBlock,
 
@@ -156,15 +329,51 @@ export type {
   ToolDefinition,
   ToolResult,
   ToolUseContext,
+  ToolCallContext,
+  ToolCallDecision,
+  ToolCallGate,
+  ToolCallGateMetadata,
   AgentInfo,
   TeamInfo,
   DelegationPoolView,
 
   // Agent
   AgentConfig,
+  AgentPromptInput,
+  AgentRunInput,
   AgentState,
   AgentRunResult,
+  RunAgentOptions,
+  RunIdentity,
+  RunIdentityLink,
+  TraceLink,
+  TraceAttributeValue,
+  RunIdentityOptions,
+  RunStatus,
+  RunStatusCode,
+  RunFlag,
+  RunOutcomeFields,
+  ApprovalScope,
+  ApprovalRequestContent,
+  PlanApprovalContent,
+  TaskRoundApprovalContent,
+  TaskDispatchApprovalContent,
+  ToolCallApprovalContent,
+  ApprovalRequest,
+  ApprovalReviewer,
+  ApprovalDecisionRecord,
+  ApprovalRecord,
+  ApprovalDecisionInput,
+  ApprovalGateDecision,
+  StructuredTraceError,
+  TraceErrorKind,
+  AgentBackendConfig,
+  ExternalAgentBackendConfig,
+  AcpAgentBackendConfig,
+  AcpPermissionPolicy,
+  AcpPermissionRequest,
   BeforeRunHookContext,
+  BeforeRunHookResult,
   ToolCallRecord,
   LoopDetectionConfig,
   LoopDetectionInfo,
@@ -173,9 +382,33 @@ export type {
   // Team
   TeamConfig,
   TeamRunResult,
+  GovernanceConclusion,
+  GovernanceUnsatisfiedReason,
+  RunMetrics,
   RunTeamOptions,
+  ExecutionRoutingConfig,
+  ExecutionRoutingStrategy,
+  RoutingFailurePolicy,
+  SemanticRoutingAssessment,
+  SemanticRoutingOutcome,
+  SemanticRoutingRecommendation,
+  TaskProfile,
+  TaskProfiler,
+  TaskProfilerContext,
+  TaskProfilerResult,
   RunTasksOptions,
   RunTaskSpec,
+  PlanPatchTaskSpec,
+  PlanPatchRetarget,
+  PlanPatch,
+  PlanRevision,
+  TaskVerificationOutcome,
+  TaskOutcome,
+  Replanner,
+  RecoveryOptions,
+  TaskMetadata,
+  TaskRequirementIssue,
+  TaskRequirements,
   RestoreOptions,
   ModelRouteConfig,
   ModelRoutingMatch,
@@ -203,8 +436,18 @@ export type {
   CoordinatorConfig,
   CheckpointOptions,
   CheckpointSnapshot,
+  CheckpointSnapshotV1,
+  CheckpointSnapshotV2,
+  CheckpointSnapshotV3,
+  CheckpointSnapshotV4,
+  CheckpointRunIdentity,
   CompletedTaskCheckpoint,
+  InFlightTaskCheckpoint,
+  PendingToolCallCheckpoint,
+  ToolCallCommitCheckpoint,
   TaskQueueSnapshot,
+  TaskQueueSnapshotV1,
+  TaskQueueSnapshotV2,
   TaskSnapshot,
 
   // Trace
@@ -218,6 +461,7 @@ export type {
   PlanReadyTrace,
   AgentStreamTrace,
   ConsensusTrace,
+  RoutingDecisionTrace,
 
   // Memory
   MemoryEntry,
@@ -229,4 +473,4 @@ export type {
   SharedMemoryWriteOptions,
 } from './types.js'
 
-export { generateRunId } from './utils/trace.js'
+export { generateRunId, generateSpanId } from './utils/trace.js'

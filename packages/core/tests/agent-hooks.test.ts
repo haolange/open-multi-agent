@@ -50,7 +50,7 @@ function buildMockAgent(config: AgentConfig, responseText: string) {
     temperature: config.temperature,
     agentName: config.name,
   })
-  ;(agent as any).runner = runner
+  ;(agent as any).backend = runner
 
   return { agent, calls }
 }
@@ -330,7 +330,7 @@ describe('Agent hooks — beforeRun / afterRun', () => {
       model: config.model,
       agentName: config.name,
     })
-    ;(agent as any).runner = runner
+    ;(agent as any).backend = runner
 
     // Directly call run which creates a single text-only user message.
     // To test mixed content, we need to go through the private executeRun.
@@ -377,6 +377,41 @@ describe('Agent hooks — beforeRun / afterRun', () => {
     const history = agent.getHistory()
     const firstUserInHistory = history.find(m => m.role === 'user')
     expect((firstUserInHistory!.content[0] as any).text).toBe('original message')
+  })
+
+  it('restores constructor history for stateless prompt conversations', async () => {
+    const history: LLMMessage[] = [
+      {
+        role: 'user',
+        content: [{ type: 'text', text: 'previous question' }],
+      },
+      {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'previous answer' }],
+      },
+    ]
+    const { agent, calls } = buildMockAgent({ ...baseConfig, history }, 'new answer')
+
+    await agent.prompt('follow-up question')
+
+    expect(calls[0]).toEqual([
+      ...history,
+      {
+        role: 'user',
+        content: [{ type: 'text', text: 'follow-up question' }],
+      },
+    ])
+    expect(agent.getHistory()).toEqual([
+      ...history,
+      {
+        role: 'user',
+        content: [{ type: 'text', text: 'follow-up question' }],
+      },
+      {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'new answer' }],
+      },
+    ])
   })
 
   // -----------------------------------------------------------------------

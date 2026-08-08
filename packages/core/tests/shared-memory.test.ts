@@ -1,10 +1,26 @@
 import { describe, it, expect } from 'vitest'
 import { z } from 'zod'
 import { SharedMemory } from '../src/memory/shared.js'
+import { RedactingStore } from '../src/memory/redacting-store.js'
+import { InMemoryStore } from '../src/memory/store.js'
 import { Team } from '../src/team/team.js'
+import { APPROVAL_KEY_PREFIX } from '../src/approval/durable.js'
 import type { MemoryEntry, MemoryStore } from '../src/types.js'
 
 describe('SharedMemory', () => {
+  it('keeps checkpoint and approval records out of agent-visible memory', async () => {
+    const store = new InMemoryStore()
+    const mem = new SharedMemory(store)
+    await mem.write('agent', 'visible', 'value')
+    await store.set('__oma_checkpoint__/latest', '{"checkpoint":true}')
+    await store.set(`${APPROVAL_KEY_PREFIX}apr_test`, '{"approval":true}')
+
+    expect((await mem.listAll()).map((entry) => entry.key)).toEqual(['agent/visible'])
+    expect(await mem.read(`${APPROVAL_KEY_PREFIX}apr_test`)).toBeNull()
+    expect((await mem.snapshot()).entries.map((entry) => entry.key)).toEqual(['agent/visible'])
+    expect(await mem.getSummary()).not.toContain('approval')
+  })
+
   // -------------------------------------------------------------------------
   // Write & read
   // -------------------------------------------------------------------------
@@ -47,6 +63,31 @@ describe('SharedMemory', () => {
     const aliceEntries = await mem.listByAgent('alice')
     expect(aliceEntries).toHaveLength(2)
     expect(aliceEntries.every((e) => e.key.startsWith('alice/'))).toBe(true)
+  })
+
+  // -------------------------------------------------------------------------
+  // Redaction on persist (RedactingStore backend)
+  // -------------------------------------------------------------------------
+
+  it('masks secrets on write while preserving namespacing and metadata', async () => {
+    const mem = new SharedMemory(new RedactingStore(new InMemoryStore()))
+    await mem.write('alice', 'result', 'the token is sk-abcdefghijklmnop', { kind: 'answer' })
+
+    const entry = await mem.read('alice/result')
+    expect(entry).not.toBeNull()
+    expect(entry!.value).not.toContain('sk-abcdefghijklmnop')
+    expect(entry!.value).toContain('[redacted]')
+    // Namespacing + provenance metadata survive redaction.
+    expect(entry!.key).toBe('alice/result')
+    expect(entry!.metadata).toMatchObject({ agent: 'alice', kind: 'answer' })
+  })
+
+  it('redacts a structured value while keeping it parseable on read', async () => {
+    const mem = new SharedMemory(new RedactingStore(new InMemoryStore()))
+    await mem.write('alice', 'creds', { token: 'sk-abcdefghijklmnop', ok: true })
+
+    const entry = await mem.read('alice/creds')
+    expect(entry!.value).toEqual({ token: '[redacted]', ok: true })
   })
 
   // -------------------------------------------------------------------------

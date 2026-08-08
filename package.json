@@ -9,10 +9,16 @@
   "scripts": {
     "build": "npm run build --workspaces --if-present",
     "dev": "npm run dev -w @open-multi-agent/core",
+    "pretest": "npm run test:example-catalog",
     "test": "npm run test --workspaces --if-present",
+    "test:example-catalog": "node --test scripts/example-catalog.test.mjs && node scripts/validate-example-catalog.mjs",
     "test:watch": "npm run test:watch -w @open-multi-agent/core",
     "test:coverage": "npm run test:coverage -w @open-multi-agent/core",
     "test:e2e": "npm run test:e2e -w @open-multi-agent/core",
+    "bench:observability:ci": "node scripts/observability-benchmark-ci.mjs",
+    "test:eval-examples": "node scripts/eval-example-smoke.mjs",
+    "test:observability-examples": "node scripts/observability-example-smoke.mjs",
+    "test:observability-pack": "node scripts/observability-tarball-smoke.mjs",
     "test:scaffold": "npm run test:scaffold --workspaces --if-present",
     "lint": "npm run lint --workspaces --if-present"
   },
@@ -22,6 +28,6 @@
     "url": "git+https://github.com/open-multi-agent/open-multi-agent.git"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
   }
 }

@@ -1,6 +1,6 @@
 {
   "name": "@open-multi-agent/core",
-  "version": "1.8.0",
+  "version": "1.14.0",
   "description": "TypeScript multi-agent framework: one runTeam() call from goal to result. Auto task decomposition and parallel execution for multi-step LLM jobs. Deploys anywhere Node.js runs.",
   "files": [
     "dist",
@@ -21,6 +21,22 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
+    "./observability": {
+      "types": "./dist/observability/index.d.ts",
+      "import": "./dist/observability/index.js"
+    },
+    "./observability/file": {
+      "types": "./dist/observability/file.d.ts",
+      "import": "./dist/observability/file.js"
+    },
+    "./acp": {
+      "types": "./dist/acp.d.ts",
+      "import": "./dist/acp.js"
+    },
+    "./process": {
+      "types": "./dist/process.d.ts",
+      "import": "./dist/process.js"
+    },
     "./mcp": {
       "types": "./dist/mcp.d.ts",
       "import": "./dist/mcp.js"
@@ -28,6 +44,18 @@
     "./ai-sdk": {
       "types": "./dist/ai-sdk.d.ts",
       "import": "./dist/ai-sdk.js"
+    },
+    "./classifiers": {
+      "types": "./dist/classifiers.d.ts",
+      "import": "./dist/classifiers.js"
+    },
+    "./eval": {
+      "types": "./dist/eval/index.d.ts",
+      "import": "./dist/eval/index.js"
+    },
+    "./eval/file": {
+      "types": "./dist/eval/file.d.ts",
+      "import": "./dist/eval/file.js"
     },
     "./package.json": "./package.json"
   },
@@ -39,6 +67,8 @@
     "test:coverage": "vitest run --coverage",
     "lint": "tsc --noEmit",
     "test:e2e": "RUN_E2E=1 vitest run tests/e2e/",
+    "test:e2e:deepseek": "RUN_E2E=1 vitest run tests/e2e/deepseek-e2e.test.ts",
+    "test:semantic-routing-shadow": "RUN_E2E=1 vitest run --reporter=dot tests/e2e/semantic-routing-shadow.test.ts",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
@@ -68,20 +98,24 @@
     "url": "https://github.com/open-multi-agent/open-multi-agent/issues"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.52.0",
-    "openai": "^4.73.0",
+    "openai": "^6.49.0",
     "zod": "^3.23.0"
   },
   "peerDependencies": {
+    "@agentclientprotocol/sdk": "^1.2.0",
     "@aws-sdk/client-bedrock-runtime": "^3.700.0",
     "@google/genai": "^1.48.0",
     "@modelcontextprotocol/sdk": "^1.18.0",
-    "ai": "^5.0.0 || ^6.0.0"
+    "ai": "^5.0.0 || ^6.0.0 || ^7.0.0"
   },
   "peerDependenciesMeta": {
+    "@agentclientprotocol/sdk": {
+      "optional": true
+    },
     "@aws-sdk/client-bedrock-runtime": {
       "optional": true
     },
@@ -96,14 +130,15 @@
     }
   },
   "devDependencies": {
-    "@ai-sdk/openai": "^3.0.0",
-    "@ai-sdk/provider": "^3.0.0",
+    "@agentclientprotocol/sdk": "^1.2.1",
+    "@ai-sdk/openai": "^4.0.0",
+    "@ai-sdk/provider": "^4.0.0",
     "@aws-sdk/client-bedrock-runtime": "^3.1040.0",
     "@google/genai": "^1.48.0",
     "@modelcontextprotocol/sdk": "^1.18.0",
     "@types/node": "^22.0.0",
     "@vitest/coverage-v8": "^2.1.9",
-    "ai": "^6.0.0",
+    "ai": "^7.0.0",
     "tsx": "^4.21.0",
     "typescript": "^5.6.0",
     "vitest": "^2.1.0"

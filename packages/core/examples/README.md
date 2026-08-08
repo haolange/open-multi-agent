@@ -4,15 +4,22 @@ Runnable scripts demonstrating `open-multi-agent`. Organized by category — pic
 
 All scripts run with `npx tsx packages/core/examples/<category>/<name>.ts`. Scripts that call a model require the corresponding API key in your environment. The full applications (see the apps section below) are the exception: they have their own `package.json` and start scripts.
 
+[`catalog.json`](catalog.json) is the machine-readable inventory and website
+classification contract. The physical directories below remain the maintenance
+taxonomy; a catalog `goal` controls discovery by user intent without requiring a
+file move. `npm run test:example-catalog` validates the metadata and fails when a
+standalone example or top-level example directory is not registered.
+
 ---
 
 ## basics — start here
 
-The four core execution modes. Read these first.
+Core execution modes and input shapes. Read these first.
 
 | Example | What it shows |
 |---------|---------------|
 | [`basics/single-agent`](basics/single-agent.ts) | One agent with bash + file tools, then streaming via the `Agent` class. |
+| [`basics/structured-input`](basics/structured-input.ts) | Caller-owned message history and image blocks through `runAgent()`. |
 | [`basics/team-collaboration`](basics/team-collaboration.ts) | `runTeam()` coordinator pattern — goal in, results out. |
 | [`basics/task-pipeline`](basics/task-pipeline.ts) | `runTasks()` with explicit task DAG and dependencies. |
 | [`basics/multi-model-team`](basics/multi-model-team.ts) | Different models per agent in one team. |
@@ -52,14 +59,20 @@ Reusable shapes for common multi-agent problems.
 |---------|---------|
 | [`patterns/fan-out-aggregate`](patterns/fan-out-aggregate.ts) | MapReduce-style fan-out via `AgentPool.runParallel()`. |
 | [`patterns/structured-output`](patterns/structured-output.ts) | Zod-validated JSON output from an agent. |
+| [`patterns/rich-tool-results`](patterns/rich-tool-results.ts) | Keep application-owned tool data separate while returning image content to the model. |
 | [`patterns/task-retry`](patterns/task-retry.ts) | Per-task retry with exponential backoff. |
 | [`patterns/multi-perspective-code-review`](patterns/multi-perspective-code-review.ts) | Multiple reviewer agents in parallel, then synthesis. |
 | [`patterns/research-aggregation`](patterns/research-aggregation.ts) | Multi-source research collated by a synthesis agent. |
+| [`patterns/event-driven-dag`](patterns/event-driven-dag.ts) | No-key deferred-promise proof that a downstream task starts when its dependency completes without waiting for unrelated work. |
 | [`patterns/cost-tiered-pipeline`](patterns/cost-tiered-pipeline.ts) | Run the same four-stage pipeline twice to compare flagship vs tiered model cost. |
 | [`patterns/agent-handoff`](patterns/agent-handoff.ts) | Synchronous sub-agent delegation via `delegate_to_agent`. |
+| [`patterns/risk-gated-bash`](patterns/risk-gated-bash.ts) | Per-call `onToolCall` gate + `classifyBashCommand`: auto-pass read-only bash, human-review ambiguous, block destructive. |
+| [`patterns/durable-approval`](patterns/durable-approval.ts) | No-key suspend → atomic reviewer decision → fresh-orchestrator restore of the exact approved task. |
 | [`patterns/plan-replay`](patterns/plan-replay.ts) | Pin a coordinator plan with `createPlanArtifact`, then replay it with `runFromPlan`, no coordinator re-run. |
 | [`patterns/consensus`](patterns/consensus.ts) | Proposer→judge refutation loop via `runConsensus()`: default judge prompt and per-judge `judgePrompt` function. |
 | [`patterns/cross-provider-reasoning`](patterns/cross-provider-reasoning.ts) | Preserve a reasoning model's thought stream across providers via `preserveReasoningAsText`. |
+| [`patterns/eval-offline-regression`](patterns/eval-offline-regression.ts) | No-key EvalSet regression across two model configurations with rule + judge scorers and a gate. |
+| [`patterns/eval-online-sampling`](patterns/eval-online-sampling.ts) | Best-effort online sampling into `FileEvalStore` with explicit flush and shutdown. |
 
 ## cookbook — use-case recipes
 
@@ -67,6 +80,7 @@ End-to-end examples framed around a concrete problem (meeting summarization, tra
 
 | Example | Problem solved |
 |---------|----------------|
+| [`cookbook/adaptive-customer-support`](cookbook/adaptive-customer-support.ts) | `runTeam()` selects only the relevant specialists for a shipping or billing escalation, then synthesizes a grounded customer response. |
 | [`cookbook/meeting-summarizer`](cookbook/meeting-summarizer.ts) | Fan-out post-processing of a transcript into summary, structured action items, and sentiment. |
 | [`cookbook/contract-review-dag`](cookbook/contract-review-dag.ts) | 4-task DAG (extract → compliance-check + summary → notify) with step-level retry. Run normally or with `FORCE_FAIL=task2` to exercise retry. |
 | [`cookbook/incident-postmortem-dag`](cookbook/incident-postmortem-dag.ts) | 5-task DAG with three parallel root tasks (log patterns + deploy correlation + blast radius) feeding root-cause hypothesis and final postmortem synthesis. |
@@ -84,8 +98,10 @@ Hooking the framework up to outside-the-box tooling.
 | Example | Integrates with |
 |---------|-----------------|
 | [`integrations/trace-observability`](integrations/trace-observability.ts) | `onTrace` spans for LLM calls, tools, and tasks. |
+| [`integrations/observability-v2/`](integrations/observability-v2/) | No-key runnable v2 batching, InMemory/File TraceStore, OTel in-memory provider, CLI, SIGTERM server, and FaaS lifecycle examples. |
 | [`integrations/mcp-github`](integrations/mcp-github.ts) | An MCP server's tools exposed to an agent via `connectMCPTools()`. |
 | [`integrations/mcp-bilig-workpaper`](integrations/mcp-bilig-workpaper.ts) | Bilig WorkPaper MCP tools for formula readback, recalculation, and persisted workbook JSON. |
+| [`integrations/mcp-open-design`](integrations/mcp-open-design.ts) | Batch fan-out over an MCP server's async jobs: N Open Design runs generated in parallel via `runTasks()`, each polling `get_run` to completion with code-driven orchestration. |
 ## apps — full applications
 
 Complete, clone-and-run applications with their own `package.json` and dependencies. These embed OMA in a real backend, so they use `npm install` plus their own start script rather than `npx tsx`.
@@ -118,3 +134,4 @@ Conventions:
 - **Imports** should resolve as `from '../../src/index.js'` for scripts (one level deeper than the old flat layout); full applications with their own `package.json` import the published `@open-multi-agent/core` package name instead.
 - **Match the provider template** when adding a provider: three-agent team (architect / developer / reviewer) building a small REST API. Keeps comparisons honest.
 - **Add a row** to the table in this file for the corresponding category.
+- **Add exactly one entry** to [`catalog.json`](catalog.json), including its user goal, capability tags, format, level, and any directory entrypoints. Do not move an example merely to change its website grouping.

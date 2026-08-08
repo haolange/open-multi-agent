@@ -5,7 +5,7 @@ import { AgentRunner, type RunOptions } from '../src/agent/runner.js'
 import { ToolRegistry, defineTool } from '../src/tool/framework.js'
 import { ToolExecutor } from '../src/tool/executor.js'
 import { executeWithRetry } from '../src/orchestrator/orchestrator.js'
-import { emitTrace, generateRunId } from '../src/utils/trace.js'
+import { emitTrace, generateRunId, generateSpanId } from '../src/utils/trace.js'
 import { createTask } from '../src/task/task.js'
 import type {
   AgentConfig,
@@ -78,7 +78,7 @@ function buildMockAgent(
     temperature: config.temperature,
     agentName: config.name,
   })
-  ;(agent as any).runner = runner
+  ;(agent as any).backend = runner
 
   return agent
 }
@@ -93,6 +93,7 @@ describe('emitTrace', () => {
     emitTrace(undefined, {
       type: 'agent',
       runId: 'r1',
+      spanId: 's1',
       agent: 'a',
       turns: 1,
       tokens: { input_tokens: 0, output_tokens: 0 },
@@ -108,6 +109,7 @@ describe('emitTrace', () => {
     const event: TraceEvent = {
       type: 'agent',
       runId: 'r1',
+      spanId: 's1',
       agent: 'a',
       turns: 1,
       tokens: { input_tokens: 0, output_tokens: 0 },
@@ -126,6 +128,7 @@ describe('emitTrace', () => {
       emitTrace(fn, {
         type: 'agent',
         runId: 'r1',
+        spanId: 's1',
         agent: 'a',
         turns: 1,
         tokens: { input_tokens: 0, output_tokens: 0 },
@@ -143,6 +146,7 @@ describe('emitTrace', () => {
     emitTrace(fn as unknown as (event: TraceEvent) => void, {
       type: 'agent',
       runId: 'r1',
+      spanId: 's1',
       agent: 'a',
       turns: 1,
       tokens: { input_tokens: 0, output_tokens: 0 },
@@ -169,6 +173,17 @@ describe('generateRunId', () => {
   })
 })
 
+describe('generateSpanId', () => {
+  it('returns unique UUID strings', () => {
+    const ids = new Set(Array.from({ length: 100 }, generateSpanId))
+
+    expect(ids.size).toBe(100)
+    for (const id of ids) {
+      expect(id).toMatch(/^[0-9a-f-]{36}$/)
+    }
+  })
+})
+
 // ---------------------------------------------------------------------------
 // AgentRunner trace events
 // ---------------------------------------------------------------------------
@@ -189,6 +204,7 @@ describe('AgentRunner trace events', () => {
       onTrace: (e) => { traces.push(e) },
       runId: 'run-1',
       traceAgent: 'test-agent',
+      traceSpanId: 'agent-span-1',
     }
 
     await runner.run(
@@ -202,6 +218,8 @@ describe('AgentRunner trace events', () => {
     const llm = llmTraces[0]!
     expect(llm.type).toBe('llm_call')
     expect(llm.runId).toBe('run-1')
+    expect(llm.spanId).toMatch(/^[0-9a-f-]{36}$/)
+    expect(llm.parentId).toBe('agent-span-1')
     expect(llm.agent).toBe('test-agent')
     expect(llm.model).toBe('test-model')
     expect(llm.turn).toBe(1)
@@ -235,7 +253,12 @@ describe('AgentRunner trace events', () => {
 
     await runner.run(
       [{ role: 'user', content: [{ type: 'text', text: 'test' }] }],
-      { onTrace: (e) => { traces.push(e) }, runId: 'run-2', traceAgent: 'tooler' },
+      {
+        onTrace: (e) => { traces.push(e) },
+        runId: 'run-2',
+        traceAgent: 'tooler',
+        traceSpanId: 'agent-span-2',
+      },
     )
 
     const toolTraces = traces.filter(t => t.type === 'tool_call')
@@ -244,6 +267,8 @@ describe('AgentRunner trace events', () => {
     const tool = toolTraces[0]!
     expect(tool.type).toBe('tool_call')
     expect(tool.runId).toBe('run-2')
+    expect(tool.spanId).toMatch(/^[0-9a-f-]{36}$/)
+    expect(tool.parentId).toBe('agent-span-2')
     expect(tool.agent).toBe('tooler')
     expect(tool.tool).toBe('echo')
     expect(tool.isError).toBe(false)
@@ -322,6 +347,85 @@ describe('AgentRunner trace events', () => {
     // consumers can diagnose failures without reaching for separate channels.
     expect(toolTraces[0]!.output).toContain('fail')
     expect(toolTraces[0]!.input).toEqual({})
+  })
+
+  it('tool_call trace includes gate fields when onToolCall denies execution', async () => {
+    const traces: TraceEvent[] = []
+    const execute = vi.fn(async () => ({ data: 'SHOULD_NOT_RUN' }))
+    const registry = new ToolRegistry()
+    registry.register(
+      defineTool({
+        name: 'bash',
+        description: 'runs shell',
+        inputSchema: z.object({ command: z.string() }),
+        execute,
+      }),
+    )
+    const executor = new ToolExecutor(registry, {
+      onToolCall: async () => ({ action: 'deny', reason: 'blocked by policy' }),
+    })
+    const adapter = mockAdapter([
+      toolUseResponse('bash', { command: 'rm -rf /tmp/demo' }),
+      textResponse('Handled'),
+    ])
+
+    const runner = new AgentRunner(adapter, registry, executor, {
+      model: 'test-model',
+      agentName: 'tooler',
+      allowedTools: ['bash'],
+    })
+
+    await runner.run(
+      [{ role: 'user', content: [{ type: 'text', text: 'test' }] }],
+      { onTrace: (e) => { traces.push(e) }, runId: 'run-gated', traceAgent: 'tooler' },
+    )
+
+    expect(execute).not.toHaveBeenCalled()
+    const tool = traces.find((t): t is Extract<TraceEvent, { type: 'tool_call' }> => t.type === 'tool_call')!
+    expect(tool.isError).toBe(true)
+    expect(tool.output).toContain('blocked by policy')
+    expect(tool.gated).toBe(true)
+    expect(tool.gateAction).toBe('deny')
+    expect(tool.gateReason).toBe('blocked by policy')
+  })
+
+  it('redacts sensitive gateReason values in tool_call traces', async () => {
+    const traces: TraceEvent[] = []
+    const execute = vi.fn(async () => ({ data: 'SHOULD_NOT_RUN' }))
+    const registry = new ToolRegistry()
+    registry.register(
+      defineTool({
+        name: 'bash',
+        description: 'runs shell',
+        inputSchema: z.object({ command: z.string() }),
+        execute,
+      }),
+    )
+    const executor = new ToolExecutor(registry, {
+      onToolCall: async () => ({ action: 'deny', reason: 'password=hunter2' }),
+    })
+    const adapter = mockAdapter([
+      toolUseResponse('bash', { command: 'echo ok' }),
+      textResponse('Handled'),
+    ])
+
+    const runner = new AgentRunner(adapter, registry, executor, {
+      model: 'test-model',
+      agentName: 'tooler',
+      allowedTools: ['bash'],
+    })
+
+    await runner.run(
+      [{ role: 'user', content: [{ type: 'text', text: 'test' }] }],
+      { onTrace: (e) => { traces.push(e) }, runId: 'run-redacted-gate', traceAgent: 'tooler' },
+    )
+
+    expect(execute).not.toHaveBeenCalled()
+    const tool = traces.find((t): t is Extract<TraceEvent, { type: 'tool_call' }> => t.type === 'tool_call')!
+    expect(tool.gated).toBe(true)
+    expect(tool.gateAction).toBe('deny')
+    expect(tool.gateReason).toBe('password=[redacted]')
+    expect(tool.gateReason).not.toContain('hunter2')
   })
 
   it('tool_call trace.output reflects executor truncation', async () => {
@@ -463,6 +567,15 @@ describe('Agent trace events', () => {
 
     for (const trace of traces) {
       expect(trace.runId).toBe(runId)
+    }
+
+    const agentTrace = traces.find(t => t.type === 'agent')
+    expect(agentTrace).toBeDefined()
+    expect(agentTrace!.spanId).toMatch(/^[0-9a-f-]{36}$/)
+    expect(agentTrace!.parentId).toBeUndefined()
+
+    for (const child of traces.filter(t => t.type === 'llm_call' || t.type === 'tool_call')) {
+      expect(child.parentId).toBe(agentTrace!.spanId)
     }
   })
 

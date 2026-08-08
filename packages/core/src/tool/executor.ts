@@ -10,11 +10,26 @@
  * the framework.
  */
 
-import type { ToolResult, ToolUseContext } from '../types.js'
+import type {
+  ApprovalDecisionRecord,
+  ApprovalRequest,
+  ToolCallApprovalContent,
+  ToolCallGate,
+  ToolCallGateMetadata,
+  ToolResult,
+  ToolResultMetadata,
+  ToolUseContext,
+} from '../types.js'
 import type { ToolDefinition } from '../types.js'
 import { ToolRegistry } from './framework.js'
 import { Semaphore } from '../utils/semaphore.js'
 import type { ZodSchema } from 'zod'
+import {
+  assertApprovalDecision,
+  assertApprovalRequest,
+  hashApprovalRequest,
+} from '../approval/durable.js'
+import { copyToolResultContent } from './result.js'
 
 // ---------------------------------------------------------------------------
 // ToolExecutor
@@ -31,6 +46,22 @@ export interface ToolExecutorOptions {
    * Per-tool `maxOutputChars` takes priority over this value.
    */
   maxToolOutputChars?: number
+  /**
+   * Optional per-call gate. Runs after input validation and before execution.
+   * Returning `{ action: 'deny' }` produces an error ToolResult instead of
+   * invoking the tool implementation.
+   */
+  onToolCall?: ToolCallGate
+}
+
+export interface ToolExecutorExecutionOptions {
+  /** Per-execution gate override. Takes priority over the constructor option. */
+  readonly onToolCall?: ToolCallGate
+  /** Previously reviewed invocation supplied by checkpoint restore. */
+  readonly durableApproval?: {
+    readonly request: ApprovalRequest
+    readonly decision: ApprovalDecisionRecord
+  }
 }
 
 /** Describes one call in a batch. */
@@ -55,11 +86,13 @@ export class ToolExecutor {
   private readonly registry: ToolRegistry
   private readonly semaphore: Semaphore
   private readonly maxToolOutputChars?: number
+  private readonly onToolCall?: ToolCallGate
 
   constructor(registry: ToolRegistry, options: ToolExecutorOptions = {}) {
     this.registry = registry
     this.semaphore = new Semaphore(options.maxConcurrency ?? 4)
     this.maxToolOutputChars = options.maxToolOutputChars
+    this.onToolCall = options.onToolCall
   }
 
   // -------------------------------------------------------------------------
@@ -80,7 +113,8 @@ export class ToolExecutor {
     toolName: string,
     input: Record<string, unknown>,
     context: ToolUseContext,
-  ): Promise<ToolResult> {
+    options: ToolExecutorExecutionOptions = {},
+  ): Promise<ToolResult<any>> {
     const tool = this.registry.get(toolName)
     if (tool === undefined) {
       return this.errorResult(
@@ -95,7 +129,7 @@ export class ToolExecutor {
       )
     }
 
-    return this.runTool(tool, input, context)
+    return this.runTool(tool, input, context, options)
   }
 
   // -------------------------------------------------------------------------
@@ -114,8 +148,8 @@ export class ToolExecutor {
   async executeBatch(
     calls: BatchToolCall[],
     context: ToolUseContext,
-  ): Promise<Map<string, ToolResult>> {
-    const results = new Map<string, ToolResult>()
+  ): Promise<Map<string, ToolResult<any>>> {
+    const results = new Map<string, ToolResult<any>>()
 
     await Promise.all(
       calls.map(async (call) => {
@@ -146,45 +180,160 @@ export class ToolExecutor {
    */
   private async runTool(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    tool: ToolDefinition<any>,
+    tool: ToolDefinition<any, any>,
     rawInput: Record<string, unknown>,
     context: ToolUseContext,
-  ): Promise<ToolResult> {
+    options: ToolExecutorExecutionOptions,
+  ): Promise<ToolResult<any>> {
     // --- Zod validation ---
     const inputParseResult = this.runZodSchema(tool.inputSchema, rawInput)
     if (!inputParseResult.success) {
       return this.errorResult(
         `Invalid input for tool "${tool.name}":\n${inputParseResult.issuesMessage}`,
+        options.durableApproval
+          ? { approvalError: 'The current tool schema no longer accepts the reviewed input.' }
+          : undefined,
       )
     }
 
     // --- Abort check after parse (parse can be expensive for large inputs) ---
-    if (context.abortSignal?.aborted === true) {
+    if (this.isAbortSignalAborted(context.abortSignal)) {
       return this.errorResult(
         `Tool "${tool.name}" was aborted before execution began.`,
       )
     }
 
+    const approvalContent = this.approvalContent(
+      tool.name,
+      rawInput,
+      inputParseResult.data as Record<string, unknown>,
+      tool.consequential === true,
+      context,
+    )
+    const restoredApproval = options.durableApproval
+    const gate = options.onToolCall ?? this.onToolCall
+    let gateMetadata: ToolCallGateMetadata | undefined
+    let approvalDecision: ApprovalDecisionRecord | undefined
+    if (restoredApproval) {
+      try {
+        assertApprovalRequest(restoredApproval.request)
+        assertApprovalDecision(restoredApproval.decision, restoredApproval.request)
+        if (!approvalContent) {
+          throw new Error('Current tool context has no task/tool-call identity.')
+        }
+        const currentHash = hashApprovalRequest(
+          'tool_call',
+          restoredApproval.request.boundary,
+          approvalContent,
+        )
+        if (currentHash !== restoredApproval.request.requestHash) {
+          throw new Error('Current validated tool invocation differs from the reviewed content.')
+        }
+      } catch (error) {
+        return this.errorResult(
+          `Tool "${tool.name}" durable approval is stale or tampered: ${this.errorMessage(error)}`,
+          { approvalError: this.errorMessage(error) },
+        )
+      }
+      approvalDecision = restoredApproval.decision
+      if (approvalDecision.decision === 'rejected') {
+        gateMetadata = {
+          action: 'deny',
+          reason: `Rejected by durable reviewer "${approvalDecision.reviewer.id}".`,
+        }
+        return this.errorResult(`Tool "${tool.name}" denied by durable approval.`, {
+          toolCallGate: gateMetadata,
+          approvalDecision,
+        })
+      }
+      gateMetadata = { action: 'allow' }
+    } else if (gate) {
+      let decision: unknown
+      try {
+        decision = await gate({
+          toolName: tool.name,
+          input: inputParseResult.data as Record<string, unknown>,
+          agentName: context.agent.name,
+          ...(tool.consequential === true ? { consequential: true } : {}),
+          ...(context.runId !== undefined ? { runId: context.runId } : {}),
+          ...(context.taskId !== undefined ? { taskId: context.taskId } : {}),
+          ...(context.toolCallId !== undefined ? { toolCallId: context.toolCallId } : {}),
+        })
+      } catch (err) {
+        return this.errorResult(`Tool "${tool.name}" onToolCall hook threw an error: ${this.errorMessage(err)}`)
+      }
+      gateMetadata = this.gateMetadataFromDecision(decision)
+      if (!gateMetadata) {
+        return this.errorResult(
+          `Tool "${tool.name}" onToolCall hook returned an invalid onToolCall decision.`,
+        )
+      }
+      if (this.isAbortSignalAborted(context.abortSignal)) {
+        return this.errorResult(
+          `Tool "${tool.name}" was aborted before execution began.`,
+          { toolCallGate: gateMetadata },
+        )
+      }
+      if (gateMetadata.action === 'deny') {
+        const suffix = gateMetadata.reason ? `: ${gateMetadata.reason}` : '.'
+        return this.errorResult(`Tool "${tool.name}" denied by onToolCall${suffix}`, {
+          toolCallGate: gateMetadata,
+        })
+      }
+      if (gateMetadata.action === 'suspend') {
+        if (!approvalContent) {
+          return this.errorResult(
+            `Tool "${tool.name}" cannot suspend outside an orchestrated checkpointed task.`,
+            { toolCallGate: gateMetadata },
+          )
+        }
+        return this.errorResult(`Tool "${tool.name}" is awaiting durable approval.`, {
+          toolCallGate: gateMetadata,
+          approvalRequestContent: approvalContent,
+        })
+      }
+    }
+
     // --- Execute ---
     try {
-      const result = await tool.execute(inputParseResult.data, context)
+      const rawResult: unknown = await tool.execute(inputParseResult.data, context)
+      if (rawResult === null || typeof rawResult !== 'object' || Array.isArray(rawResult)) {
+        return this.errorResult(
+          `Invalid output for tool "${tool.name}": execute() must return a ToolResult object.`,
+          gateMetadata ? { toolCallGate: gateMetadata } : undefined,
+        )
+      }
+      const result = rawResult as ToolResult<any>
+      if (result.isError !== undefined && typeof result.isError !== 'boolean') {
+        return this.errorResult(
+          `Invalid output for tool "${tool.name}": ToolResult.isError must be a boolean when provided.`,
+          gateMetadata ? { toolCallGate: gateMetadata } : undefined,
+        )
+      }
       if (!result.isError && tool.outputSchema) {
         const outputParseResult = this.runZodSchema(tool.outputSchema, result.data)
         if (!outputParseResult.success) {
           return this.errorResult(
             `Invalid output for tool "${tool.name}":\n${outputParseResult.issuesMessage}`,
+            gateMetadata ? { toolCallGate: gateMetadata } : undefined,
           )
         }
       }
-      return this.maybeTruncate(tool, result)
+      const normalized = this.normalizeModelOutput(tool.name, result, gateMetadata)
+      const withApproval = approvalDecision === undefined
+        ? normalized
+        : {
+            ...normalized,
+            metadata: { ...normalized.metadata, approvalDecision },
+          }
+      return this.withGateMetadata(this.maybeTruncate(tool, withApproval), gateMetadata)
     } catch (err) {
-      const message =
-        err instanceof Error
-          ? err.message
-          : typeof err === 'string'
-            ? err
-            : JSON.stringify(err)
-      return this.maybeTruncate(tool, this.errorResult(`Tool "${tool.name}" threw an error: ${message}`))
+      return this.maybeTruncate(
+        tool,
+        this.errorResult(`Tool "${tool.name}" threw an error: ${this.errorMessage(err)}`, gateMetadata
+          ? { toolCallGate: gateMetadata }
+          : undefined),
+      )
     }
   }
 
@@ -209,21 +358,127 @@ export class ToolExecutor {
    */
   private maybeTruncate(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    tool: ToolDefinition<any>,
-    result: ToolResult,
-  ): ToolResult {
+    tool: ToolDefinition<any, any>,
+    result: ToolResult<any>,
+  ): ToolResult<any> {
     const maxChars = tool.maxOutputChars ?? this.maxToolOutputChars
-    if (maxChars === undefined || maxChars <= 0 || result.data.length <= maxChars) {
+    // Preserve the legacy contract exactly: maxOutputChars truncates an
+    // implicit string result. Explicit modelOutput is already a caller-owned,
+    // compact representation and is not rewritten; non-string application data
+    // has no character length to truncate.
+    if (
+      result.modelOutput !== undefined
+      || typeof result.data !== 'string'
+      || maxChars === undefined
+      || maxChars <= 0
+      || result.data.length <= maxChars
+    ) {
       return result
     }
     return { ...result, data: truncateToolOutput(result.data, maxChars) }
   }
 
+  private normalizeModelOutput(
+    toolName: string,
+    result: ToolResult<any>,
+    gateMetadata: ToolCallGateMetadata | undefined,
+  ): ToolResult<any> {
+    if (result.isError && typeof result.data !== 'string') {
+      return this.errorResult(
+        `Invalid output for tool "${toolName}": error ToolResult.data must be a string.`,
+        gateMetadata ? { toolCallGate: gateMetadata } : undefined,
+      )
+    }
+
+    if (result.modelOutput === undefined) {
+      if (typeof result.data === 'string') return result
+      return this.errorResult(
+        `Invalid output for tool "${toolName}": non-string ToolResult.data requires modelOutput.`,
+        gateMetadata ? { toolCallGate: gateMetadata } : undefined,
+      )
+    }
+
+    let modelOutput
+    try {
+      modelOutput = copyToolResultContent(result.modelOutput)
+    } catch (error) {
+      return this.errorResult(
+        `Invalid output for tool "${toolName}": ${this.errorMessage(error)}`,
+        gateMetadata ? { toolCallGate: gateMetadata } : undefined,
+      )
+    }
+
+    if (result.isError && typeof modelOutput !== 'string') {
+      return this.errorResult(
+        `Invalid output for tool "${toolName}": error modelOutput must be a string.`,
+        gateMetadata ? { toolCallGate: gateMetadata } : undefined,
+      )
+    }
+
+    return { ...result, modelOutput }
+  }
+
+  private withGateMetadata(result: ToolResult<any>, gateMetadata: ToolCallGateMetadata | undefined): ToolResult<any> {
+    if (!gateMetadata) return result
+    return {
+      ...result,
+      metadata: {
+        ...result.metadata,
+        toolCallGate: gateMetadata,
+      },
+    }
+  }
+
+  private gateMetadataFromDecision(decision: unknown): ToolCallGateMetadata | undefined {
+    if (decision === null || typeof decision !== 'object') return undefined
+    const action = (decision as { readonly action?: unknown }).action
+    if (action !== 'allow' && action !== 'deny' && action !== 'suspend') return undefined
+    const reason = (decision as { readonly reason?: unknown }).reason
+    if (reason !== undefined && typeof reason !== 'string') return undefined
+    if ((action === 'deny' || action === 'suspend') && reason !== undefined) {
+      return { action, reason }
+    }
+    return { action }
+  }
+
+  private isAbortSignalAborted(signal: AbortSignal | undefined): boolean {
+    return signal?.aborted === true
+  }
+
+  private errorMessage(err: unknown): string {
+    return err instanceof Error
+      ? err.message
+      : typeof err === 'string'
+        ? err
+        : JSON.stringify(err)
+  }
+
+  private approvalContent(
+    toolName: string,
+    rawInput: Record<string, unknown>,
+    input: Record<string, unknown>,
+    consequential: boolean,
+    context: ToolUseContext,
+  ): ToolCallApprovalContent | undefined {
+    if (!context.taskId || !context.toolCallId) return undefined
+    return {
+      kind: 'tool_call',
+      toolName,
+      rawInput,
+      input,
+      agentName: context.agent.name,
+      taskId: context.taskId,
+      toolCallId: context.toolCallId,
+      consequential,
+    }
+  }
+
   /** Construct an error ToolResult. */
-  private errorResult(message: string): ToolResult {
+  private errorResult(message: string, metadata?: ToolResultMetadata): ToolResult {
     return {
       data: message,
       isError: true,
+      ...(metadata ? { metadata } : {}),
     }
   }
 }
